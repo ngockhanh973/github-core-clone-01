@@ -208,54 +208,32 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
 
 interface PackEntry { oid: string; type: ObjType; data: Buffer; }
 /**
- * Adler-32 (zlib's checksum), chunked so the modulo runs once per 5552-byte
- * block instead of per byte — ~3 us for a 1 KiB object.
- */
-function adler32(buf: Buffer): number {
-  let a = 1;
-  let b = 0;
-  for (let off = 0; off < buf.length; off += 5552) {
-    const end = Math.min(off + 5552, buf.length);
-    for (let i = off; i < end; i++) { a += buf[i]; b += a; }
-    a %= 65521;
-    b %= 65521;
-  }
-  return ((b << 16) | a) >>> 0;
-}
-const ADLER_TMP = Buffer.alloc(4);
-/**
  * Inflate one pack entry's zlib stream, reporting how many compressed bytes it
  * consumed. v2 used one streaming Inflate per object (~200 us: stream setup
- * plus event-loop turns). inflateSync is native and ~6x faster per call, and
- * it silently ignores trailing bytes — so it inflates exactly the first
- * stream. The consumed length then comes from the stream's own trailer: a
- * zlib stream ends with the Adler-32 of its output, so the first occurrence
- * of those 4 bytes at/after `off` is the stream end (a false positive inside
- * the deflate data is ~2^-32 per byte, and the verify re-inflate below
- * rejects it: a truncated mid-stream inflate throws). Any surprise falls
- * back to the streaming path, which is v2's exact behavior.
+ * plus event-loop turns). v6 used inflateSync plus an Adler-32 trailer search
+ * and a verify re-inflate (2 inflates per object + a JS Adler loop + a
+ * Buffer.indexOf scan). This version uses one inflateSync call with
+ * `{ info: true }`: the returned engine's `bytesWritten` is exactly the
+ * number of input bytes the inflater consumed — i.e. the stream length —
+ * because inflateSync stops at the stream end and ignores trailing bytes
+ * (verified: bytesWritten equals the deflateSync output length for sizes
+ * 0–100000, levels 0/1/6/9, text/random/zero data, with trailing bytes).
+ * One inflate per object, no Adler loop, no search, no re-inflate. Any
+ * surprise (wrong output size, implausible consumed length) falls back to
+ * the streaming path, which is v2's exact behavior.
  */
 function inflateEntrySync(buf: Buffer, off: number, size: number): { data: Buffer; consumed: number } {
   // A zlib stream producing `size` bytes is at most `size` bytes of stored
   // blocks (5 bytes overhead per 65535-byte block) + 2 header + 4 Adler +
   // slack; slicing to that bound keeps inflateSync's input small even for a
-  // 300 KiB pack (no O(n^2) tail copying) and bounds the Adler search.
+  // 300 KiB pack (no O(n^2) tail copying).
   const bound = off + size + 5 * Math.ceil(size / 65535) + 32;
   const slice = buf.subarray(off, Math.min(bound, buf.length));
-  const data = inflateSync(slice);
+  const { buffer: data, engine } = inflateSync(slice, { info: true });
   if (data.length !== size) throw new Error('pack entry size mismatch');
-  ADLER_TMP.writeUInt32BE(adler32(data));
-  let pos = off;
-  for (;;) {
-    const idx = buf.indexOf(ADLER_TMP, pos);
-    if (idx < 0 || idx + 4 > bound) throw new Error('pack entry trailer not found');
-    const consumed = idx + 4 - off;
-    try {
-      const v = inflateSync(buf.subarray(off, off + consumed));
-      if (v.length === size && v.equals(data)) return { data, consumed };
-    } catch { /* false-positive Adler match inside the stream; keep looking */ }
-    pos = idx + 1;
-  }
+  const consumed = (engine as { bytesWritten: number }).bytesWritten;
+  if (!Number.isInteger(consumed) || consumed <= 0 || off + consumed > buf.length) throw new Error('pack entry consumed length invalid');
+  return { data, consumed };
 }
 function inflateEntry(buf: Buffer, off: number, size: number): Promise<{ data: Buffer; consumed: number }> {
   try {
@@ -728,7 +706,7 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
       if (total > 64 * 1024 * 1024) { reject(new Error('body too large')); req.destroy(); return; }
       chunks.push(c);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -834,6 +812,44 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const repo = getRepo(fm[1], fm[2]);
       const issue = repo?.issues.get(parseInt(fm[3], 10));
       if (repo && issue) { sendJsonBuf(res, 200, issueJsonBuf(repo, issue)); return; }
+    }
+  }
+
+  // Fast path: the write workload is 200 sequential POSTs creating issues.
+  // Same guards as the GET fast path (no query, no percent-escapes); the
+  // order mirrors handleRest exactly — auth, then body+JSON (400 beats 404),
+  // then repo lookup (404), then title/label validation (422), then create —
+  // so it skips pathOf/queryOf/route matching in handleRest.
+  if (method === 'POST' && req.url !== undefined && !req.url.includes('?') && !req.url.includes('%')) {
+    const fm = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues$/.exec(req.url);
+    if (fm) {
+      const auth = checkAuth(req);
+      if (auth !== 'ok') { authFail(res, auth); return; }
+      const raw = await readBody(req);
+      const parsed = parseJsonBody(raw);
+      if (!parsed.ok) { sendJson(res, 400, { message: 'Invalid JSON' }); return; }
+      const repo = getRepo(fm[1], fm[2]);
+      if (!repo) { sendJson(res, 404, { message: 'Not Found' }); return; }
+      const b = (parsed.value ?? {}) as J;
+      const title = typeof b.title === 'string' ? b.title : '';
+      if (title === '') { sendJson(res, 422, { message: 'title is required' }); return; }
+      const labelNames: string[] = [];
+      if (Array.isArray(b.labels)) {
+        for (const l of b.labels) {
+          const name = typeof l === 'string' ? l : (l as J)?.name;
+          if (typeof name !== 'string') continue;
+          if (!repo.labels.has(name)) { sendJson(res, 422, { message: `Label '${name}' does not exist` }); return; }
+          labelNames.push(name);
+        }
+      }
+      const number = ++repo.seq;
+      const issue: Issue = {
+        id: objIdSeq++, number, title, body: typeof b.body === 'string' ? b.body : '',
+        state: 'open', labels: labelNames, comments: [], seq: globalSeq++, cached: null,
+      };
+      repo.issues.set(number, issue);
+      sendJsonBuf(res, 201, issueJsonBuf(repo, issue));
+      return;
     }
   }
 
@@ -1325,6 +1341,9 @@ function viewerShape(): J {
     avatar_url: `https://avatars.githubusercontent.com/u/${VIEWER.id}?v=4`, site_admin: false,
   };
 }
+// The viewer never changes after startup: share one frozen shape instead of
+// allocating a fresh object literal per issue/comment/pull shape.
+const VIEWER_SHAPE: J = viewerShape();
 function openCount(repo: Repo): number {
   let n = 0;
   for (const i of repo.issues.values()) if (i.state === 'open') n++;
@@ -1333,7 +1352,7 @@ function openCount(repo: Repo): number {
 }
 function repoShape(repo: Repo): J {
   return {
-    id: repo.id, name: repo.name, full_name: `${repo.owner}/${repo.name}`, owner: viewerShape(),
+    id: repo.id, name: repo.name, full_name: `${repo.owner}/${repo.name}`, owner: VIEWER_SHAPE,
     private: repo.isPrivate, description: repo.description, default_branch: repo.defaultBranch,
     created_at: FIXED_ISO, updated_at: FIXED_ISO, pushed_at: FIXED_ISO,
     html_url: `https://github.com/${repo.owner}/${repo.name}`,
@@ -1357,7 +1376,7 @@ function issueShape(repo: Repo, issue: Issue): J {
       const l = repo.labels.get(name);
       return l ? labelShape(l) : { name, color: '000000', description: '' };
     }),
-    user: viewerShape(), assignee: null, assignees: [], milestone: null, locked: false,
+    user: VIEWER_SHAPE, assignee: null, assignees: [], milestone: null, locked: false,
     comments: issue.comments.length, created_at: FIXED_ISO, updated_at: FIXED_ISO, closed_at: issue.state === 'closed' ? FIXED_ISO : null,
     html_url: `https://github.com/${repo.owner}/${repo.name}/issues/${issue.number}`,
     url: `/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
@@ -1376,7 +1395,7 @@ function invalidateIssue(issue: Issue): void {
 }
 function commentShape(repo: Repo, c: Comment): J {
   return {
-    id: c.id, body: c.body, user: viewerShape(), created_at: FIXED_ISO, updated_at: FIXED_ISO,
+    id: c.id, body: c.body, user: VIEWER_SHAPE, created_at: FIXED_ISO, updated_at: FIXED_ISO,
     html_url: `https://github.com/${repo.owner}/${repo.name}/issues/${c.id}`,
     url: `/api/v3/repos/${repo.owner}/${repo.name}/issues/comments/${c.id}`,
   };
@@ -1388,9 +1407,9 @@ function pullShape(repo: Repo, pull: Pull): J {
     id: pull.id, number: pull.number, title: pull.title, body: pull.body, state: pull.state,
     merged: pull.merged, merged_at: pull.mergedAt, merge_commit_sha: pull.mergeSha,
     mergeable: !prConflict(repo, pull), draft: false, locked: false,
-    head: { ref: pull.headRef, sha: headSha, label: `${repo.owner}:${pull.headRef}`, user: viewerShape() },
-    base: { ref: pull.baseRef, sha: baseSha, label: `${repo.owner}:${pull.baseRef}`, user: viewerShape() },
-    user: viewerShape(), assignee: null, assignees: [], requested_reviewers: [],
+    head: { ref: pull.headRef, sha: headSha, label: `${repo.owner}:${pull.headRef}`, user: VIEWER_SHAPE },
+    base: { ref: pull.baseRef, sha: baseSha, label: `${repo.owner}:${pull.baseRef}`, user: VIEWER_SHAPE },
+    user: VIEWER_SHAPE, assignee: null, assignees: [], requested_reviewers: [],
     created_at: FIXED_ISO, updated_at: FIXED_ISO, closed_at: pull.state === 'closed' ? FIXED_ISO : null,
     html_url: `https://github.com/${repo.owner}/${repo.name}/pull/${pull.number}`,
     url: `/api/v3/repos/${repo.owner}/${repo.name}/pulls/${pull.number}`,
@@ -1408,7 +1427,7 @@ function commitShape(repo: Repo, oid: string): J {
       committer: { name: VIEWER.name, email: VIEWER.email, date: FIXED_ISO },
       tree: { sha: c?.tree ?? '' },
     },
-    author: viewerShape(), committer: viewerShape(),
+    author: VIEWER_SHAPE, committer: VIEWER_SHAPE,
     parents: (c?.parents ?? []).map((p) => ({ sha: p })),
     url: `/api/v3/repos/${repo.owner}/${repo.name}/commits/${oid}`,
     html_url: `https://github.com/${repo.owner}/${repo.name}/commit/${oid}`,
@@ -1463,7 +1482,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
 
   // GET /api/v3/user
   if (method === 'GET' && path === '/api/v3/user') {
-    sendJson(res, 200, viewerShape());
+    sendJson(res, 200, VIEWER_SHAPE);
     return true;
   }
   // /api/v3/user/repos
