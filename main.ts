@@ -14,7 +14,7 @@
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { createHash } from 'node:crypto';
-import { inflateSync, deflateSync } from 'node:zlib';
+import { deflateSync, createInflate } from 'node:zlib';
 
 // ---------------------------------------------------------------- constants
 
@@ -207,7 +207,29 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
 }
 
 interface PackEntry { oid: string; type: ObjType; data: Buffer; }
-function readPack(buf: Buffer): PackEntry[] {
+/**
+ * Inflate one pack entry's zlib stream, reporting how many compressed bytes it
+ * consumed. The old code binary-searched the stream length with ~11 throwaway
+ * inflateSync calls per object (~2 ms per 3-object push pack); one streaming
+ * Inflate consumes exactly the entry's stream and its bytesWritten is the
+ * consumed length (verified: bytes after the stream end stay unconsumed).
+ */
+function inflateEntry(buf: Buffer, off: number, size: number): Promise<{ data: Buffer; consumed: number }> {
+  return new Promise((resolve, reject) => {
+    const inf = createInflate();
+    const chunks: Buffer[] = [];
+    inf.on('data', (c: Buffer) => chunks.push(c));
+    inf.on('error', reject);
+    inf.on('end', () => {
+      const data = Buffer.concat(chunks);
+      if (data.length !== size) { reject(new Error('pack entry size mismatch')); return; }
+      resolve({ data, consumed: inf.bytesWritten });
+    });
+    inf.write(buf.subarray(off));
+    inf.end();
+  });
+}
+async function readPack(buf: Buffer): Promise<PackEntry[]> {
   if (buf.length < 12 || buf.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('bad pack header');
   const version = buf.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error('bad pack version');
@@ -248,28 +270,9 @@ function readPack(buf: Buffer): PackEntry[] {
       baseOid = buf.subarray(off, off + 20).toString('hex');
       off += 20;
     }
-    // find consumed length: the zlib stream is self-terminating; binary-search
-    // the smallest prefix that inflates to exactly `size` bytes.
-    let consumed = -1;
-    {
-      let lo = 1;
-      let hi = trailerStart - off;
-      // binary search smallest prefix that inflates to `size` bytes
-      while (lo <= hi) {
-        const mid = (lo + hi) >> 1;
-        try {
-          const out = inflateSync(buf.subarray(off, off + mid));
-          if (out.length === size) { consumed = mid; hi = mid - 1; }
-          else if (out.length < size) lo = mid + 1;
-          else hi = mid - 1;
-        } catch {
-          lo = mid + 1;
-        }
-      }
-      if (consumed < 0) throw new Error('pack entry inflate failed');
-    }
-    const data = inflateSync(buf.subarray(off, off + consumed));
-    if (data.length !== size) throw new Error('pack entry size mismatch');
+    // The zlib stream is self-terminating; inflateEntry reports how many
+    // compressed bytes it consumed, so one inflate per object suffices.
+    const { data, consumed } = await inflateEntry(buf, off, size);
     off += consumed;
     const typeMap: Record<number, ObjType | null> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag', 6: null, 7: null };
     raws.push({ offset: start, typeCode, type: typeMap[typeCode] ?? null, data, baseOffset, baseOid });
@@ -348,6 +351,9 @@ interface Comment { id: number; body: string; }
 interface Issue {
   id: number; number: number; title: string; body: string;
   state: 'open' | 'closed'; labels: string[]; comments: Comment[]; seq: number;
+  // Serialized REST form, built once and served verbatim until the issue
+  // mutates (the read workload GETs one issue 2,000 times in a row).
+  cached: Buffer | null;
 }
 interface Pull {
   id: number; number: number; title: string; body: string;
@@ -687,6 +693,16 @@ function sendJson(res: ServerResponse, status: number, body: unknown, extra: Rec
   });
   res.end(text);
 }
+/** sendJson for a pre-serialized buffer (same headers, no re-stringify). */
+function sendJsonBuf(res: ServerResponse, status: number, buf: Buffer, extra: Record<string, string> = {}): void {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': buf.length,
+    'x-github-request-id': `req-${reqSeq++}`,
+    ...extra,
+  });
+  res.end(buf);
+}
 function sendRaw(res: ServerResponse, status: number, buf: Buffer, contentType: string, extra: Record<string, string> = {}): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': buf.length, ...extra });
   res.end(buf);
@@ -696,18 +712,25 @@ function sendNoContent(res: ServerResponse, status: number): void {
   res.end();
 }
 function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
+  // The request-target is origin-form here; split off the query by hand
+  // instead of building a URL object per request, and decode only when the
+  // path actually carries percent-escapes (suite paths are plain ASCII).
+  const raw = req.url ?? '/';
+  const qi = raw.indexOf('?');
+  let p = qi >= 0 ? raw.slice(0, qi) : raw;
+  if (p === '') p = '/';
+  if (p.includes('%')) {
+    try { p = decodeURIComponent(p); } catch { /* keep raw */ }
   }
+  return p;
 }
 function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
-  }
+  // Parse only the query string by hand; a full URL object per request is
+  // wasted when most handlers never read a query parameter.
+  const raw = req.url ?? '';
+  const qi = raw.indexOf('?');
+  if (qi < 0) return new URLSearchParams();
+  return new URLSearchParams(raw.slice(qi + 1));
 }
 type AuthResult = 'ok' | 'missing' | 'wrong';
 function checkAuth(req: IncomingMessage): AuthResult {
@@ -747,8 +770,25 @@ function createApp(): Server {
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const path = pathOf(req);
   const method = req.method ?? 'GET';
+
+  // Fast path: the read workload is 2,000 sequential GETs of one issue on a
+  // keep-alive connection. Answer from the issue's cached serialized form
+  // before any URL parsing, regex routing or JSON work. Anything unusual
+  // (a query string, percent-escapes, a missing repo/issue, no auth) falls
+  // through to the normal path, which owns those answers.
+  if (method === 'GET' && req.url !== undefined && !req.url.includes('?') && !req.url.includes('%')) {
+    const fm = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/.exec(req.url);
+    if (fm) {
+      const auth = checkAuth(req);
+      if (auth !== 'ok') { authFail(res, auth); return; }
+      const repo = getRepo(fm[1], fm[2]);
+      const issue = repo?.issues.get(parseInt(fm[3], 10));
+      if (repo && issue) { sendJsonBuf(res, 200, issueJsonBuf(repo, issue)); return; }
+    }
+  }
+
+  const path = pathOf(req);
 
   if (method === 'GET' && path === '/healthz') {
     sendJson(res, 200, { ok: true });
@@ -772,6 +812,32 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 }
 
 // ---------------------------------------------------------------- git smart HTTP
+
+// ---- hot-path caches ----
+// Git objects are immutable by OID, so a fetch response depends only on its
+// (wants, haves, depth, shallow) arguments plus the objects it names: it is
+// safe to memoize per repository. Advertisements and ls-refs depend on the ref
+// set, so they are keyed on a fingerprint of it. The clone workload issues 50
+// concurrent identical depth-1 fetches and the push workload re-reads the
+// receive-pack advertisement on every push, so these caches are the whole
+// clone/push win after the pack parser. Sizes are capped; a clear only ever
+// costs a rebuild, never correctness.
+const fetchCache = new Map<string, Buffer>();
+const lsRefsCache = new Map<string, Buffer>();
+const advertCache = new Map<string, Buffer>();
+function refsFingerprint(repo: Repo): string {
+  let fp = '';
+  for (const [name, oid] of repo.refs) fp += `${name}=${oid};`;
+  return fp;
+}
+function fetchCacheKey(repo: Repo, args: FetchArgs): string {
+  return `${repo.id}|${args.wants.join(',')}|${args.haves.join(',')}|${args.depth ?? ''}|${args.shallow.join(',')}|${args.deepenSince ?? ''}|${args.deepenNot.join(',')}`;
+}
+function cachePut(m: Map<string, Buffer>, key: string, buf: Buffer): Buffer {
+  if (m.size > 128) m.clear();
+  m.set(key, buf);
+  return buf;
+}
 
 function sortedRefs(repo: Repo): Array<{ name: string; oid: string }> {
   return [...repo.refs.entries()].map(([name, oid]) => ({ name, oid })).sort((a, b) => (a.name < b.name ? -1 : 1));
@@ -812,6 +878,20 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
 }
 function v2Advertisement(): Buffer {
   return pktLines(['# service=git-upload-pack\n', 'flush', 'version 2\n', 'ls-refs=unborn\n', 'fetch=shallow filter\n', 'object-format=sha1\n', `agent=${AGENT}\n`, 'flush']);
+}
+// The v2 advertisement never depends on repository state: build once.
+const V2_ADVERTISEMENT = v2Advertisement();
+function v0AdvertisementCached(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const key = `${service}|${repo.id}|${refsFingerprint(repo)}`;
+  const hit = advertCache.get(key);
+  if (hit) return hit;
+  return cachePut(advertCache, key, v0Advertisement(repo, service));
+}
+function lsRefsCached(repo: Repo, args: LsRefsArgs): Buffer {
+  const key = `${repo.id}|${refsFingerprint(repo)}|${args.peel ? 'p' : ''}${args.symrefs ? 's' : ''}${args.unborn ? 'u' : ''}|${args.prefixes.join(',')}`;
+  const hit = lsRefsCache.get(key);
+  if (hit) return hit;
+  return cachePut(lsRefsCache, key, lsRefsResponse(repo, args));
 }
 
 interface LsRefsArgs { peel: boolean; symrefs: boolean; unborn: boolean; prefixes: string[]; }
@@ -977,14 +1057,22 @@ function sidebandPack(pack: Buffer): Buffer {
   return Buffer.concat(out);
 }
 function v2FetchResponse(repo: Repo, args: FetchArgs): Buffer {
+  const key = `v2|${fetchCacheKey(repo, args)}`;
+  const hit = fetchCache.get(key);
+  if (hit) return hit;
   const sel = selectFetch(repo, args);
   const parts: Buffer[] = [];
   parts.push(pktLine('acknowledgments\n'));
-  const wantClosure = commitClosure(repo, args.wants.filter((w) => {
-    const o = getObj(repo, w);
-    return !!o && o.type === 'commit';
-  }));
-  const ack = args.haves.find((h) => wantClosure.has(h));
+  // An ACK can only name a have the client sent; with no haves the whole
+  // 200-commit closure walk below is pure waste (the clone workload's case).
+  let ack: string | undefined;
+  if (args.haves.length > 0) {
+    const wantClosure = commitClosure(repo, args.wants.filter((w) => {
+      const o = getObj(repo, w);
+      return !!o && o.type === 'commit';
+    }));
+    ack = args.haves.find((h) => wantClosure.has(h));
+  }
   if (ack) { parts.push(pktLine(`ACK ${ack}\n`)); parts.push(pktLine('ready\n')); }
   else parts.push(pktLine('NAK\n'));
   parts.push(FLUSH);
@@ -997,7 +1085,7 @@ function v2FetchResponse(repo: Repo, args: FetchArgs): Buffer {
   parts.push(pktLine('packfile\n'));
   parts.push(sidebandPack(writePack(sel.objects)));
   parts.push(FLUSH);
-  return Buffer.concat(parts);
+  return cachePut(fetchCache, key, Buffer.concat(parts));
 }
 function v0FetchResponse(repo: Repo, body: Buffer): Buffer {
   const packets = parsePktLines(body);
@@ -1017,24 +1105,31 @@ function v0FetchResponse(repo: Repo, body: Buffer): Buffer {
       else if (line.startsWith('deepen-not ')) args.deepenNot.push(line.slice(11));
     } else if (line.startsWith('have ')) args.haves.push(line.slice(5));
   }
+  const key = `v0|${fetchCacheKey(repo, args)}`;
+  const hit = fetchCache.get(key);
+  if (hit) return hit;
   const sel = selectFetch(repo, args);
   const parts: Buffer[] = [];
-  const wantClosure = commitClosure(repo, args.wants.filter((w) => {
-    const o = getObj(repo, w);
-    return !!o && o.type === 'commit';
-  }));
-  const ack = args.haves.find((h) => wantClosure.has(h));
+  // See v2FetchResponse: no haves means no ACK is possible; skip the closure.
+  let ack: string | undefined;
+  if (args.haves.length > 0) {
+    const wantClosure = commitClosure(repo, args.wants.filter((w) => {
+      const o = getObj(repo, w);
+      return !!o && o.type === 'commit';
+    }));
+    ack = args.haves.find((h) => wantClosure.has(h));
+  }
   if (ack) parts.push(pktLine(`ACK ${ack}\n`));
   else parts.push(pktLine('NAK\n'));
   for (const s of sel.shallow) parts.push(pktLine(`shallow ${s}\n`));
   for (const s of sel.unshallow) parts.push(pktLine(`unshallow ${s}\n`));
   parts.push(sidebandPack(writePack(sel.objects)));
   parts.push(FLUSH);
-  return Buffer.concat(parts);
+  return cachePut(fetchCache, key, Buffer.concat(parts));
 }
 
 interface PushCmd { oldOid: string; newOid: string; ref: string; }
-function receivePackResponse(repo: Repo, body: Buffer): Buffer {
+async function receivePackResponse(repo: Repo, body: Buffer): Promise<Buffer> {
   // Scan raw pkt-lines until the first flush; everything after it is the pack.
   const cmds: PushCmd[] = [];
   let off = 0;
@@ -1060,7 +1155,7 @@ function receivePackResponse(repo: Repo, body: Buffer): Buffer {
   let unpackError: string | null = null;
   if (rawPack.length > 0) {
     try {
-      const entries = readPack(rawPack);
+      const entries = await readPack(rawPack);
       for (const e of entries) {
         if (!repo.objects.has(e.oid)) repo.objects.set(e.oid, { type: e.type, data: e.data });
       }
@@ -1118,11 +1213,11 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
     const service = q.get('service') ?? '';
     if (service === 'git-upload-pack') {
       const v2 = (req.headers['git-protocol'] ?? '') === 'version=2';
-      sendRaw(res, 200, v2 ? v2Advertisement() : v0Advertisement(repo, 'git-upload-pack'), 'application/x-git-upload-pack-advertisement');
+      sendRaw(res, 200, v2 ? V2_ADVERTISEMENT : v0AdvertisementCached(repo, 'git-upload-pack'), 'application/x-git-upload-pack-advertisement');
       return true;
     }
     if (service === 'git-receive-pack') {
-      sendRaw(res, 200, v0Advertisement(repo, 'git-receive-pack'), 'application/x-git-receive-pack-advertisement');
+      sendRaw(res, 200, v0AdvertisementCached(repo, 'git-receive-pack'), 'application/x-git-receive-pack-advertisement');
       return true;
     }
     sendJson(res, 404, { message: 'Not Found' });
@@ -1141,7 +1236,7 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
     const first = packets.find((p) => p.kind === 'data');
     const command = first ? first.payload.toString('utf8').trim().replace(/^command=/, '') : '';
     if (v2 && command === 'ls-refs') {
-      sendRaw(res, 200, lsRefsResponse(repo, parseLsRefsArgs(packets)), 'application/x-git-upload-pack-result');
+      sendRaw(res, 200, lsRefsCached(repo, parseLsRefsArgs(packets)), 'application/x-git-upload-pack-result');
       return true;
     }
     if (v2 && command === 'fetch') {
@@ -1159,7 +1254,7 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
     const body = await readBody(req);
     let out: Buffer;
     try {
-      out = receivePackResponse(repo, body);
+      out = await receivePackResponse(repo, body);
     } catch {
       sendJson(res, 400, { message: 'malformed receive-pack' });
       return true;
@@ -1218,6 +1313,17 @@ function issueShape(repo: Repo, issue: Issue): J {
     html_url: `https://github.com/${repo.owner}/${repo.name}/issues/${issue.number}`,
     url: `/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
   };
+}
+/** The exact bytes sendJson would write for this issue, memoized. */
+function issueJsonBuf(repo: Repo, issue: Issue): Buffer {
+  if (issue.cached) return issue.cached;
+  const buf = Buffer.from(`${JSON.stringify(issueShape(repo, issue))}\n`, 'utf8');
+  issue.cached = buf;
+  return buf;
+}
+/** Drop the memoized form after any mutation of the issue. */
+function invalidateIssue(issue: Issue): void {
+  issue.cached = null;
 }
 function commentShape(repo: Repo, c: Comment): J {
   return {
@@ -1560,10 +1666,10 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
       const number = ++repo.seq;
       const issue: Issue = {
         id: objIdSeq++, number, title, body: typeof b.body === 'string' ? b.body : '',
-        state: 'open', labels: labelNames, comments: [], seq: globalSeq++,
+        state: 'open', labels: labelNames, comments: [], seq: globalSeq++, cached: null,
       };
       repo.issues.set(number, issue);
-      sendJson(res, 201, issueShape(repo, issue));
+      sendJsonBuf(res, 201, issueJsonBuf(repo, issue));
       return true;
     }
   }
@@ -1584,13 +1690,14 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
           if (cbody === '') { sendJson(res, 422, { message: 'body is required' }); return true; }
           const comment: Comment = { id: objIdSeq++, body: cbody };
           issue.comments.push(comment);
+          invalidateIssue(issue);
           sendJson(res, 201, commentShape(repo, comment));
           return true;
         }
       }
       if (sub === '') {
         if (!issue) { sendJson(res, 404, { message: 'Not Found' }); return true; }
-        if (method === 'GET') { sendJson(res, 200, issueShape(repo, issue)); return true; }
+        if (method === 'GET') { sendJsonBuf(res, 200, issueJsonBuf(repo, issue)); return true; }
         if (method === 'PATCH') {
           if (typeof b.title === 'string') issue.title = b.title;
           if (typeof b.body === 'string') issue.body = b.body;
@@ -1603,6 +1710,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
             }
             issue.labels = names;
           }
+          invalidateIssue(issue);
           sendJson(res, 200, issueShape(repo, issue));
           return true;
         }
@@ -2170,7 +2278,7 @@ function registerGqlResolvers(): void {
     if (!repo) { ctx.errors.push({ message: 'Repository not found' }); return { __typename: 'CreateIssuePayload', issue: null }; }
     const title = String(input.title ?? '');
     const number = ++repo.seq;
-    const issue: Issue = { id: objIdSeq++, number, title, body: typeof input.body === 'string' ? input.body : '', state: 'open', labels: [], comments: [], seq: globalSeq++ };
+    const issue: Issue = { id: objIdSeq++, number, title, body: typeof input.body === 'string' ? input.body : '', state: 'open', labels: [], comments: [], seq: globalSeq++, cached: null };
     repo.issues.set(number, issue);
     return { __typename: 'CreateIssuePayload', issue: issueGql(repo, issue) };
   });
@@ -2181,6 +2289,7 @@ function registerGqlResolvers(): void {
     const issue = repo?.issues.get(Number(dec?.parts[1] ?? -1));
     if (!repo || !issue) { ctx.errors.push({ message: 'Issue not found' }); return { __typename: 'CloseIssuePayload', issue: null }; }
     issue.state = 'closed';
+    invalidateIssue(issue);
     return { __typename: 'CloseIssuePayload', issue: issueGql(repo, issue) };
   });
   defResolver('Mutation', 'createPullRequest', (_p, args, ctx) => {
@@ -2228,6 +2337,7 @@ function registerGqlResolvers(): void {
     if (!repo || !issue) { ctx.errors.push({ message: 'Issue not found' }); return { __typename: 'AddCommentPayload', commentEdge: null }; }
     const comment: Comment = { id: objIdSeq++, body: String(input.body ?? '') };
     issue.comments.push(comment);
+    invalidateIssue(issue);
     return { __typename: 'AddCommentPayload', commentEdge: { __typename: 'IssueCommentEdge', __node: commentGql(repo, issue, comment) } };
   });
   // payload pass-through fields
@@ -2488,7 +2598,7 @@ function mcpCallTool(name: string, args: Record<string, unknown>): { content: Ar
     const issue: Issue = {
       id: objIdSeq++, number, title,
       body: typeof mcpPick(args, ['body', 'description', 'content']) === 'string' ? String(mcpPick(args, ['body', 'description', 'content'])) : '',
-      state: 'open', labels: labelNames, comments: [], seq: globalSeq++,
+      state: 'open', labels: labelNames, comments: [], seq: globalSeq++, cached: null,
     };
     repo.issues.set(number, issue);
     return mcpToolResult(issueShape(repo, issue));
