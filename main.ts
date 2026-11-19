@@ -14,7 +14,7 @@
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { createHash } from 'node:crypto';
-import { deflateSync, createInflate } from 'node:zlib';
+import { deflateSync, inflateSync, createInflate } from 'node:zlib';
 
 // ---------------------------------------------------------------- constants
 
@@ -208,27 +208,76 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
 
 interface PackEntry { oid: string; type: ObjType; data: Buffer; }
 /**
- * Inflate one pack entry's zlib stream, reporting how many compressed bytes it
- * consumed. The old code binary-searched the stream length with ~11 throwaway
- * inflateSync calls per object (~2 ms per 3-object push pack); one streaming
- * Inflate consumes exactly the entry's stream and its bytesWritten is the
- * consumed length (verified: bytes after the stream end stay unconsumed).
+ * Adler-32 (zlib's checksum), chunked so the modulo runs once per 5552-byte
+ * block instead of per byte — ~3 us for a 1 KiB object.
  */
-function inflateEntry(buf: Buffer, off: number, size: number): Promise<{ data: Buffer; consumed: number }> {
-  return new Promise((resolve, reject) => {
-    const inf = createInflate();
-    const chunks: Buffer[] = [];
-    inf.on('data', (c: Buffer) => chunks.push(c));
-    inf.on('error', reject);
-    inf.on('end', () => {
-      const data = Buffer.concat(chunks);
-      if (data.length !== size) { reject(new Error('pack entry size mismatch')); return; }
-      resolve({ data, consumed: inf.bytesWritten });
-    });
-    inf.write(buf.subarray(off));
-    inf.end();
-  });
+function adler32(buf: Buffer): number {
+  let a = 1;
+  let b = 0;
+  for (let off = 0; off < buf.length; off += 5552) {
+    const end = Math.min(off + 5552, buf.length);
+    for (let i = off; i < end; i++) { a += buf[i]; b += a; }
+    a %= 65521;
+    b %= 65521;
+  }
+  return ((b << 16) | a) >>> 0;
 }
+const ADLER_TMP = Buffer.alloc(4);
+/**
+ * Inflate one pack entry's zlib stream, reporting how many compressed bytes it
+ * consumed. v2 used one streaming Inflate per object (~200 us: stream setup
+ * plus event-loop turns). inflateSync is native and ~6x faster per call, and
+ * it silently ignores trailing bytes — so it inflates exactly the first
+ * stream. The consumed length then comes from the stream's own trailer: a
+ * zlib stream ends with the Adler-32 of its output, so the first occurrence
+ * of those 4 bytes at/after `off` is the stream end (a false positive inside
+ * the deflate data is ~2^-32 per byte, and the verify re-inflate below
+ * rejects it: a truncated mid-stream inflate throws). Any surprise falls
+ * back to the streaming path, which is v2's exact behavior.
+ */
+function inflateEntrySync(buf: Buffer, off: number, size: number): { data: Buffer; consumed: number } {
+  // A zlib stream producing `size` bytes is at most `size` bytes of stored
+  // blocks (5 bytes overhead per 65535-byte block) + 2 header + 4 Adler +
+  // slack; slicing to that bound keeps inflateSync's input small even for a
+  // 300 KiB pack (no O(n^2) tail copying) and bounds the Adler search.
+  const bound = off + size + 5 * Math.ceil(size / 65535) + 32;
+  const slice = buf.subarray(off, Math.min(bound, buf.length));
+  const data = inflateSync(slice);
+  if (data.length !== size) throw new Error('pack entry size mismatch');
+  ADLER_TMP.writeUInt32BE(adler32(data));
+  let pos = off;
+  for (;;) {
+    const idx = buf.indexOf(ADLER_TMP, pos);
+    if (idx < 0 || idx + 4 > bound) throw new Error('pack entry trailer not found');
+    const consumed = idx + 4 - off;
+    try {
+      const v = inflateSync(buf.subarray(off, off + consumed));
+      if (v.length === size && v.equals(data)) return { data, consumed };
+    } catch { /* false-positive Adler match inside the stream; keep looking */ }
+    pos = idx + 1;
+  }
+}
+function inflateEntry(buf: Buffer, off: number, size: number): Promise<{ data: Buffer; consumed: number }> {
+  try {
+    return Promise.resolve(inflateEntrySync(buf, off, size));
+  } catch {
+    // Fallback: v2's streaming inflate (exact old behavior).
+    return new Promise((resolve, reject) => {
+      const inf = createInflate();
+      const chunks: Buffer[] = [];
+      inf.on('data', (c: Buffer) => chunks.push(c));
+      inf.on('error', reject);
+      inf.on('end', () => {
+        const data = Buffer.concat(chunks);
+        if (data.length !== size) { reject(new Error('pack entry size mismatch')); return; }
+        resolve({ data, consumed: inf.bytesWritten });
+      });
+      inf.write(buf.subarray(off));
+      inf.end();
+    });
+  }
+}
+const PACK_TYPE_MAP: Record<number, ObjType | null> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag', 6: null, 7: null };
 async function readPack(buf: Buffer): Promise<PackEntry[]> {
   if (buf.length < 12 || buf.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('bad pack header');
   const version = buf.readUInt32BE(4);
@@ -274,7 +323,7 @@ async function readPack(buf: Buffer): Promise<PackEntry[]> {
     // compressed bytes it consumed, so one inflate per object suffices.
     const { data, consumed } = await inflateEntry(buf, off, size);
     off += consumed;
-    const typeMap: Record<number, ObjType | null> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag', 6: null, 7: null };
+    const typeMap: Record<number, ObjType | null> = PACK_TYPE_MAP;
     raws.push({ offset: start, typeCode, type: typeMap[typeCode] ?? null, data, baseOffset, baseOid });
   }
   const byOffset = new Map<number, PackEntry>();
