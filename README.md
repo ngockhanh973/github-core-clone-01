@@ -1,5 +1,9 @@
 # github-core-clone-01
 
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/ngockhanh973/github-core-clone-01/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard)
+[![reward](https://make.fun/badge/github-core-clone-01/ngockhanh973/github-core-clone-01/reward.svg)](https://make.fun/bounty/github-core-clone-01)
+
 Standalone GitHub-compatible git forge in one process, Node 22 standard library only.
 
 - Git smart HTTP: protocol v2 upload-pack (`ls-refs`, `fetch`, shallow/deepen), v0 receive-pack with `report-status` / `side-band-64k` / `delete-refs`, fast-forward enforcement per ref.
