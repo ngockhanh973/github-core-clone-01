@@ -1056,11 +1056,12 @@ interface Repo {
   id: number; name: string; owner: string; description: string; isPrivate: boolean;
   defaultBranch: string; refs: Map<string, string>; objects: Map<string, GitObj>;
   graph: CommitGraph;
+  gitVersion: number;
   issues: Map<number, Issue>;
   openIssues: Issue[];
   closedIssues: Issue[];
   allIssues: Issue[];
-  issuesVersion: number;
+  issueVersion: number;
   issueListCache: Map<string, IssueListCacheEntry>;
   pulls: Map<number, Pull>; labels: Map<string, Label>;
   seq: number; createdSeq: number;
@@ -1097,13 +1098,19 @@ function createRepoRecord(name: string, isPrivate: boolean, description: string)
   const repo: Repo = {
     id: repoIdSeq++, name, owner: VIEWER_LOGIN, description, isPrivate,
     defaultBranch: 'main', refs: new Map(), objects: new Map(), graph: new CommitGraph(),
+    gitVersion: 1,
     issues: new Map(), openIssues: [], closedIssues: [], allIssues: [],
-    issuesVersion: 1, issueListCache: new Map(),
+    issueVersion: 1, issueListCache: new Map(),
     pulls: new Map(), labels: new Map(), seq: 0, createdSeq: globalSeq++,
   };
   repos.set(repoKey(repo.owner, name), repo);
   reposById.set(repo.id, repo);
   return repo;
+}
+
+/** Split-version choke-point for Git ref/branch mutations: bumps gitVersion only (never invalidates issue caches). */
+function bumpGitVersion(repo: Repo): void {
+  repo.gitVersion++;
 }
 
 function insertIssueSortedBySeq(arr: Issue[], issue: Issue): void {
@@ -1136,26 +1143,30 @@ function createIssueRecord(repo: Repo, title: string, body: string, labelNames: 
   repo.issues.set(number, issue);
   repo.openIssues.push(issue);
   repo.allIssues.push(issue);
-  repo.issuesVersion++;
-  if (repo.issueListCache.size > 0) repo.issueListCache.clear();
+  invalidateIssueState(repo);
   return issue;
 }
-/** Single mutation choke-point: keeps issue JSON cache, list index, list cache, and ETag strictly in sync. */
-function invalidateIssue(repo: Repo, issue: Issue, prevState?: 'open' | 'closed'): void {
-  if (prevState !== undefined && prevState !== issue.state) {
-    if (prevState === 'open') {
-      removeIssueFromSorted(repo.openIssues, issue);
-      insertIssueSortedBySeq(repo.closedIssues, issue);
-    } else {
-      removeIssueFromSorted(repo.closedIssues, issue);
-      insertIssueSortedBySeq(repo.openIssues, issue);
+/** Split-version choke-point for Issue/comment/label mutations: bumps issueVersion + clears issueListCache (never invalidates Git caches). */
+function invalidateIssueState(repo: Repo, issue?: Issue, prevState?: 'open' | 'closed'): void {
+  if (issue !== undefined) {
+    if (prevState !== undefined && prevState !== issue.state) {
+      if (prevState === 'open') {
+        removeIssueFromSorted(repo.openIssues, issue);
+        insertIssueSortedBySeq(repo.closedIssues, issue);
+      } else {
+        removeIssueFromSorted(repo.closedIssues, issue);
+        insertIssueSortedBySeq(repo.openIssues, issue);
+      }
     }
+    issue.jsonBuf = null;
+    issue.rev++;
+    issue.etag = `W/"i-${issue.number}-v${issue.rev}"`;
   }
-  issue.jsonBuf = null;
-  issue.rev++;
-  issue.etag = `W/"i-${issue.number}-v${issue.rev}"`;
-  repo.issuesVersion++;
+  repo.issueVersion++;
   if (repo.issueListCache.size > 0) repo.issueListCache.clear();
+}
+function invalidateIssue(repo: Repo, issue: Issue, prevState?: 'open' | 'closed'): void {
+  invalidateIssueState(repo, issue, prevState);
 }
 
 // object helpers bound to a repo
@@ -1427,6 +1438,7 @@ function squashMerge(repo: Repo, pull: Pull): { ok: boolean; sha?: string; reaso
   const msg = `Merge pull request #${pull.number} from ${pull.headRef}\n\n${pull.title}`;
   const sha = makeCommit(repo, headTree, [baseTip], msg);
   repo.refs.set(`refs/heads/${pull.baseRef}`, sha);
+  bumpGitVersion(repo);
   pull.state = 'closed';
   pull.merged = true;
   pull.mergedAt = FIXED_ISO;
@@ -1760,7 +1772,7 @@ function tryHandleSync(req: IncomingMessage, res: ServerResponse): boolean {
           const repoName = decodeSeg(rawPath.slice(s1 + 1, s2));
           const repo = getRepo(owner, repoName);
           if (!repo) { sendJson(res, 404, { message: 'Not Found' }); return true; }
-          const listEtag = `"list-v${repo.issuesVersion}"`;
+          const listEtag = `"list-v${repo.issueVersion}"`;
           if (etagMatches(req.headers['if-none-match'], listEtag)) {
             sendNotModified(res, listEtag);
             return true;
@@ -2082,13 +2094,13 @@ function v2Advertisement(): Buffer {
 // The v2 advertisement never depends on repository state: build once.
 const V2_ADVERTISEMENT = v2Advertisement();
 function v0AdvertisementCached(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
-  const key = `${service}|${repo.id}|${refsFingerprint(repo)}`;
+  const key = `${service}|${repo.id}|${repo.gitVersion}`;
   const hit = advertCache.get(key);
   if (hit) return hit;
   return cachePut(advertCache, key, v0Advertisement(repo, service));
 }
 function lsRefsCached(repo: Repo, args: LsRefsArgs): Buffer {
-  const key = `${repo.id}|${refsFingerprint(repo)}|${args.peel ? 'p' : ''}${args.symrefs ? 's' : ''}${args.unborn ? 'u' : ''}|${args.prefixes.join(',')}`;
+  const key = `${repo.id}|${repo.gitVersion}|${args.peel ? 'p' : ''}${args.symrefs ? 's' : ''}${args.unborn ? 'u' : ''}|${args.prefixes.join(',')}`;
   const hit = lsRefsCache.get(key);
   if (hit) return hit;
   return cachePut(lsRefsCache, key, lsRefsResponse(repo, args));
@@ -2554,25 +2566,27 @@ async function receivePackResponse(repo: Repo, body: Buffer): Promise<Buffer> {
     for (const c of cmds) lines.push(`ng ${c.ref} unpack failed\n`);
   } else {
     lines.push('unpack ok\n');
+    let refsChanged = false;
     for (const c of cmds) {
       if (!c.ref.startsWith('refs/')) { lines.push(`ng ${c.ref} invalid ref\n`); continue; }
       const current = repo.refs.get(c.ref);
       if (c.newOid === ZERO_OID) {
         if (current === undefined) lines.push(`ng ${c.ref} no such ref\n`);
         else if (current !== c.oldOid) lines.push(`ng ${c.ref} non-fast-forward\n`);
-        else { repo.refs.delete(c.ref); lines.push(`ok ${c.ref}\n`); }
+        else { repo.refs.delete(c.ref); refsChanged = true; lines.push(`ok ${c.ref}\n`); }
       } else if (c.oldOid === ZERO_OID) {
         if (current !== undefined) lines.push(`ng ${c.ref} non-fast-forward\n`);
-        else { repo.refs.set(c.ref, c.newOid); lines.push(`ok ${c.ref}\n`); }
+        else { repo.refs.set(c.ref, c.newOid); refsChanged = true; lines.push(`ok ${c.ref}\n`); }
       } else if (current === undefined || current !== c.oldOid) {
         lines.push(`ng ${c.ref} non-fast-forward\n`);
       } else if (c.oldOid === c.newOid || isAncestor(repo, c.oldOid, c.newOid)) {
-        repo.refs.set(c.ref, c.newOid);
+        if (c.oldOid !== c.newOid) { repo.refs.set(c.ref, c.newOid); refsChanged = true; }
         lines.push(`ok ${c.ref}\n`);
       } else {
         lines.push(`ng ${c.ref} non-fast-forward\n`);
       }
     }
+    if (refsChanged) bumpGitVersion(repo);
   }
   const inner = pktLines([...lines, 'flush']);
   return Buffer.concat([sidebandPack(inner, 65515), FLUSH]);
@@ -2811,7 +2825,7 @@ function getIssueListCached(repo: Repo, q: IssueListQuery, host: string, reqPath
   }
 
   const link = buildIssueListLink(host, reqPath, q, total);
-  const etag = `"list-v${repo.issuesVersion}"`;
+  const etag = `"list-v${repo.issueVersion}"`;
   const entry: IssueListCacheEntry = { buf, link, etag };
   if (repo.issueListCache.size >= 64) repo.issueListCache.clear();
   repo.issueListCache.set(cacheKey, entry);
@@ -2954,9 +2968,14 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
       repos.delete(repoKey(repo.owner, repo.name));
       repo.name = b.name;
       repos.set(repoKey(repo.owner, repo.name), repo);
-      for (const iss of repo.allIssues) invalidateIssue(repo, iss);
+      for (const iss of repo.allIssues) invalidateIssueState(repo, iss);
     }
-    if (typeof b.default_branch === 'string' && repo.refs.has(`refs/heads/${b.default_branch}`)) repo.defaultBranch = b.default_branch;
+    if (typeof b.default_branch === 'string' && repo.refs.has(`refs/heads/${b.default_branch}`)) {
+      if (repo.defaultBranch !== b.default_branch) {
+        repo.defaultBranch = b.default_branch;
+        bumpGitVersion(repo);
+      }
+    }
     sendJson(res, 200, repoShape(repo));
     return true;
   }
@@ -3003,6 +3022,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
     const obj = getObj(repo, sha);
     if (!obj || obj.type !== 'commit') { sendJson(res, 422, { message: 'Object does not exist' }); return true; }
     repo.refs.set(ref, sha);
+    bumpGitVersion(repo);
     sendJson(res, 201, { ref, object: { sha, type: 'commit' } });
     return true;
   }
@@ -3068,7 +3088,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
       let tip = repo.refs.get(`refs/heads/${branch}`);
       if (tip === undefined) {
         const defTip = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
-        if (defTip !== undefined) { repo.refs.set(`refs/heads/${branch}`, defTip); tip = defTip; }
+        if (defTip !== undefined) { repo.refs.set(`refs/heads/${branch}`, defTip); bumpGitVersion(repo); tip = defTip; }
       }
       const baseTree = tip ? commitTreeOid(repo, tip) : null;
       const files = new Map<string, { mode: string; oid: string }>();
@@ -3082,6 +3102,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
       const newTree = commitTree(repo, baseTree, new Map([[cpath, data]]));
       const newCommit = makeCommit(repo, newTree, tip ? [tip] : [], message);
       repo.refs.set(`refs/heads/${branch}`, newCommit);
+      bumpGitVersion(repo);
       const blobOid = hashObject('blob', data);
       sendJson(res, existing ? 200 : 201, {
         content: {
@@ -3110,6 +3131,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
       const newTree = commitTree(repo, baseTree, new Map([[cpath, null]]));
       const newCommit = makeCommit(repo, newTree, [tip], message);
       repo.refs.set(`refs/heads/${branch}`, newCommit);
+      bumpGitVersion(repo);
       sendJson(res, 200, { commit: { sha: newCommit, message } });
       return true;
     }
@@ -3134,7 +3156,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
   // issues
   if (tail === 'issues') {
     if (method === 'GET' || method === 'HEAD') {
-      const listEtag = `"list-v${repo.issuesVersion}"`;
+      const listEtag = `"list-v${repo.issueVersion}"`;
       if (etagMatches(req.headers['if-none-match'], listEtag)) {
         sendNotModified(res, listEtag);
         return true;
