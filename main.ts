@@ -14,7 +14,8 @@
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { createHash } from 'node:crypto';
-import { deflateSync, inflateSync, createInflate } from 'node:zlib';
+import { deflateSync, inflateSync, createInflate, constants as zlibConstants } from 'node:zlib';
+import type { Inflate } from 'node:zlib';
 
 // ---------------------------------------------------------------- constants
 
@@ -209,97 +210,316 @@ function parsePktLines(buf: Buffer): Pkt[] {
 // ---------------------------------------------------------------- packfile
 
 function applyDelta(base: Buffer, delta: Buffer): Buffer {
+  const deltaLen = delta.length;
   let off = 0;
-  const readVarint = (): number => {
-    let v = 0;
-    let shift = 0;
-    for (;;) {
-      if (off >= delta.length) throw new Error('delta truncated');
-      const b = delta[off++];
-      v |= (b & 0x7f) << shift;
-      shift += 7;
-      if (!(b & 0x80)) break;
-    }
-    return v;
-  };
-  const srcSize = readVarint();
+  let srcSize = 0;
+  let shift = 0;
+  for (;;) {
+    if (off >= deltaLen) throw new Error('delta truncated');
+    const b = delta[off++];
+    srcSize |= (b & 0x7f) << shift;
+    shift += 7;
+    if (!(b & 0x80)) break;
+  }
   if (srcSize !== base.length) throw new Error('delta base size mismatch');
-  const tgtSize = readVarint();
-  const out = Buffer.alloc(tgtSize);
+  let tgtSize = 0;
+  shift = 0;
+  for (;;) {
+    if (off >= deltaLen) throw new Error('delta truncated');
+    const b = delta[off++];
+    tgtSize |= (b & 0x7f) << shift;
+    shift += 7;
+    if (!(b & 0x80)) break;
+  }
+  // Single allocation via allocUnsafe; never exposed unless written === tgtSize.
+  const out = Buffer.allocUnsafe(tgtSize);
   let written = 0;
-  while (off < delta.length) {
+  const baseLen = base.length;
+  while (off < deltaLen) {
     const op = delta[off++];
     if (op & 0x80) {
       let cpOff = 0;
       let cpSize = 0;
-      for (let i = 0; i < 4; i++) if (op & (1 << i)) cpOff |= delta[off++] << (8 * i);
-      for (let i = 0; i < 3; i++) if (op & (0x10 << i)) cpSize |= delta[off++] << (8 * i);
+      if (op & 0x01) cpOff |= delta[off++];
+      if (op & 0x02) cpOff |= delta[off++] << 8;
+      if (op & 0x04) cpOff |= delta[off++] << 16;
+      if (op & 0x08) cpOff |= (delta[off++] << 24) >>> 0;
+      if (op & 0x10) cpSize |= delta[off++];
+      if (op & 0x20) cpSize |= delta[off++] << 8;
+      if (op & 0x40) cpSize |= delta[off++] << 16;
       if (cpSize === 0) cpSize = 0x10000;
-      if (cpOff + cpSize > base.length || written + cpSize > tgtSize) throw new Error('delta copy out of range');
+      if (off > deltaLen || cpOff + cpSize > baseLen || written + cpSize > tgtSize) throw new Error('delta copy out of range');
       base.copy(out, written, cpOff, cpOff + cpSize);
       written += cpSize;
     } else if (op !== 0) {
-      if (off + op > delta.length || written + op > tgtSize) throw new Error('delta insert out of range');
+      if (off + op > deltaLen || written + op > tgtSize) throw new Error('delta insert out of range');
       delta.copy(out, written, off, off + op);
       off += op;
       written += op;
-    } else throw new Error('delta opcode 0');
+    } else {
+      throw new Error('delta opcode 0');
+    }
   }
   if (written !== tgtSize) throw new Error('delta size mismatch');
   return out;
 }
 
 interface PackEntry { oid: string; type: ObjType; data: Buffer; packedEntry?: Buffer | null; obj?: GitObj; }
+
+const MAX_SYNC_INFLATE_SIZE = 2 * 1024 * 1024;
+type SyncInflateHandle = Inflate & {
+  _processChunk?: (chunk: Buffer, flushFlag: number) => Buffer;
+  reset?: () => void;
+};
+
+// Adaptive Inflater: boot-time self-test checks whether a dedicated sync-only
+// Inflate handle supports _processChunk + reset() safely on this Node runtime
+// (exact content + exact bytesWritten across consecutive resets with trailing
+// bytes). If 100% verified, uses the reusable handle fast path; otherwise falls
+// back cleanly to bounded inflateSync with tightly sized chunkSize.
+let reusableInflate: SyncInflateHandle | null = null;
+function initAdaptiveInflater(): void {
+  try {
+    const inf = createInflate({ chunkSize: 16384 }) as SyncInflateHandle;
+    if (typeof inf._processChunk !== 'function' || typeof inf.reset !== 'function') {
+      inf.close();
+      perfDiag.inflaterMode = 'bounded-inflateSync';
+      return;
+    }
+    const samples = [
+      Buffer.from('self-test-sample-one'),
+      Buffer.alloc(0),
+      Buffer.from('self-test-sample-two-after-reset-0123456789'),
+    ];
+    for (let i = 0; i < samples.length; i++) {
+      const raw = samples[i];
+      const comp = deflateSync(raw, { level: 6 });
+      const withTrail = Buffer.concat([comp, Buffer.from('TRAILING_BYTES')]);
+      const prevBw = inf.bytesWritten;
+      const out = inf._processChunk(withTrail, zlibConstants.Z_SYNC_FLUSH);
+      const consumed = inf.bytesWritten - prevBw;
+      if (!Buffer.isBuffer(out) || !out.equals(raw) || consumed !== comp.length) {
+        inf.close();
+        perfDiag.inflaterMode = 'bounded-inflateSync';
+        return;
+      }
+      inf.reset();
+    }
+    reusableInflate = inf;
+    perfDiag.inflaterMode = 'reuse-handle';
+  } catch {
+    reusableInflate = null;
+    perfDiag.inflaterMode = 'bounded-inflateSync';
+  }
+}
+initAdaptiveInflater();
+
 /**
- * Inflate one pack entry's zlib stream, reporting how many compressed bytes it
- * consumed. v2 used one streaming Inflate per object (~200 us: stream setup
- * plus event-loop turns). v6 used inflateSync plus an Adler-32 trailer search
- * and a verify re-inflate (2 inflates per object + a JS Adler loop + a
- * Buffer.indexOf scan). This version uses one inflateSync call with
- * `{ info: true }`: the returned engine's `bytesWritten` is exactly the
- * number of input bytes the inflater consumed — i.e. the stream length —
- * because inflateSync stops at the stream end and ignores trailing bytes
- * (verified: bytesWritten equals the deflateSync output length for sizes
- * 0–100000, levels 0/1/6/9, text/random/zero data, with trailing bytes).
- * One inflate per object, no Adler loop, no search, no re-inflate. Any
- * surprise (wrong output size, implausible consumed length) falls back to
- * the streaming path, which is v2's exact behavior.
+ * Inflate one pack entry's zlib stream synchronously (for entries < 2 MiB),
+ * reporting exact compressed bytes consumed via engine.bytesWritten.
  */
 function inflateEntrySync(buf: Buffer, off: number, size: number): { data: Buffer; consumed: number } {
+  if (size >= MAX_SYNC_INFLATE_SIZE) throw new Error('entry exceeds sync inflate threshold');
   // A zlib stream producing `size` bytes is at most `size` bytes of stored
-  // blocks (5 bytes overhead per 65535-byte block) + 2 header + 4 Adler +
-  // slack; slicing to that bound keeps inflateSync's input small even for a
-  // 300 KiB pack (no O(n^2) tail copying).
+  // blocks (5 bytes overhead per 65535-byte block) + 2 header + 4 Adler + slack.
   const bound = off + size + 5 * Math.ceil(size / 65535) + 32;
   const slice = buf.subarray(off, Math.min(bound, buf.length));
-  const { buffer: data, engine } = inflateSync(slice, { info: true });
+  if (reusableInflate !== null && size <= 65536) {
+    try {
+      const prevBw = reusableInflate.bytesWritten;
+      const data = reusableInflate._processChunk!(slice, zlibConstants.Z_SYNC_FLUSH);
+      const consumed = reusableInflate.bytesWritten - prevBw;
+      reusableInflate.reset!();
+      if (data.length === size && Number.isInteger(consumed) && consumed > 0 && off + consumed <= buf.length) {
+        return { data, consumed };
+      }
+    } catch {
+      // Disable handle reuse permanently if runtime invariant ever breaks.
+      try { reusableInflate.close(); } catch { /* ignore */ }
+      reusableInflate = null;
+      perfDiag.inflaterMode = 'bounded-inflateSync';
+    }
+  }
+  const chunkSize = size < 1024 ? 1024 : size > 65536 ? 65536 : size;
+  const { buffer: data, engine } = inflateSync(slice, {
+    info: true,
+    maxOutputLength: size > 0 ? size : 1,
+    chunkSize,
+  });
   if (data.length !== size) throw new Error('pack entry size mismatch');
   const consumed = (engine as { bytesWritten: number }).bytesWritten;
   if (!Number.isInteger(consumed) || consumed <= 0 || off + consumed > buf.length) throw new Error('pack entry consumed length invalid');
   return { data, consumed };
 }
-function inflateEntry(buf: Buffer, off: number, size: number): Promise<{ data: Buffer; consumed: number }> {
-  try {
-    return Promise.resolve(inflateEntrySync(buf, off, size));
-  } catch {
-    // Fallback: v2's streaming inflate (exact old behavior).
-    return new Promise((resolve, reject) => {
-      const inf = createInflate();
-      const chunks: Buffer[] = [];
-      inf.on('data', (c: Buffer) => chunks.push(c));
-      inf.on('error', reject);
-      inf.on('end', () => {
-        const data = Buffer.concat(chunks);
-        if (data.length !== size) { reject(new Error('pack entry size mismatch')); return; }
-        resolve({ data, consumed: inf.bytesWritten });
-      });
-      inf.write(buf.subarray(off));
-      inf.end();
+function inflateEntryStream(buf: Buffer, off: number, size: number): Promise<{ data: Buffer; consumed: number }> {
+  return new Promise((resolve, reject) => {
+    const inf = createInflate();
+    const chunks: Buffer[] = [];
+    inf.on('data', (c: Buffer) => chunks.push(c));
+    inf.on('error', reject);
+    inf.on('end', () => {
+      const data = Buffer.concat(chunks);
+      if (data.length !== size) { reject(new Error('pack entry size mismatch')); return; }
+      resolve({ data, consumed: inf.bytesWritten });
     });
+    inf.write(buf.subarray(off));
+    inf.end();
+  });
+}
+
+// Per-pack bounded byte LRU (32 MiB cap, skipping individual objects > 1 MiB)
+// used during delta resolution so each base is resolved at most once (O(K) for
+// nested delta chains) and released immediately when readPack() finishes.
+const DELTA_BASE_LRU_MAX_BYTES = 32 * 1024 * 1024;
+const DELTA_BASE_MAX_ITEM_BYTES = 1024 * 1024;
+class DeltaBaseByteLru {
+  private byOffset = new Map<number, PackEntry>();
+  private byOid = new Map<string, PackEntry>();
+  private lruOffsets = new Map<number, number>(); // offset -> byteLen (insertion order = LRU)
+  private totalBytes = 0;
+
+  getByOffset(offset: number): PackEntry | undefined {
+    const entry = this.byOffset.get(offset);
+    if (entry === undefined) return undefined;
+    const sz = this.lruOffsets.get(offset);
+    if (sz !== undefined) {
+      this.lruOffsets.delete(offset);
+      this.lruOffsets.set(offset, sz);
+    }
+    return entry;
+  }
+  getByOid(oid: string): PackEntry | undefined {
+    return this.byOid.get(oid);
+  }
+  put(offset: number, entry: PackEntry): void {
+    const sz = entry.data.length;
+    if (sz > DELTA_BASE_MAX_ITEM_BYTES) return;
+    if (this.lruOffsets.has(offset)) return;
+    while (this.totalBytes + sz > DELTA_BASE_LRU_MAX_BYTES && this.lruOffsets.size > 0) {
+      const oldestOff = this.lruOffsets.keys().next().value as number;
+      const oldestSz = this.lruOffsets.get(oldestOff) as number;
+      this.lruOffsets.delete(oldestOff);
+      this.totalBytes -= oldestSz;
+      const evicted = this.byOffset.get(oldestOff);
+      this.byOffset.delete(oldestOff);
+      if (evicted !== undefined) this.byOid.delete(evicted.oid);
+    }
+    this.lruOffsets.set(offset, sz);
+    this.totalBytes += sz;
+    this.byOffset.set(offset, entry);
+    this.byOid.set(entry.oid, entry);
+  }
+  clear(): void {
+    this.byOffset.clear();
+    this.byOid.clear();
+    this.lruOffsets.clear();
+    this.totalBytes = 0;
   }
 }
+
+interface RawPackItem {
+  offset: number;
+  typeCode: number;
+  type: ObjType | null;
+  data: Buffer;
+  baseOffset: number | null;
+  baseOid: string | null;
+  packedEntry: Buffer | null;
+}
+
 const PACK_TYPE_MAP: Record<number, ObjType | null> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag', 6: null, 7: null };
-async function readPack(buf: Buffer): Promise<PackEntry[]> {
+
+function resolvePackRaws(
+  raws: RawPackItem[],
+  rawByOffset: Map<number, RawPackItem>,
+  existingObjects?: Map<string, GitObj>,
+): PackEntry[] {
+  const baseCache = new DeltaBaseByteLru();
+  let rawByOid: Map<string, RawPackItem> | null = null;
+  const seen = new Set<number>();
+
+  const ensureRawByOid = (): Map<string, RawPackItem> => {
+    if (rawByOid !== null) return rawByOid;
+    rawByOid = new Map<string, RawPackItem>();
+    for (let i = 0; i < raws.length; i++) {
+      const r = raws[i];
+      if (r.type !== null) {
+        const oid = hashObject(r.type, r.data);
+        rawByOid.set(oid, r);
+      }
+    }
+    return rawByOid;
+  };
+
+  const resolve = (raw: RawPackItem): PackEntry => {
+    const cached = baseCache.getByOffset(raw.offset);
+    if (cached !== undefined) return cached;
+    if (seen.has(raw.offset)) throw new Error('delta cycle');
+    seen.add(raw.offset);
+    let entry: PackEntry;
+    try {
+      if (raw.type !== null) {
+        entry = { oid: hashObject(raw.type, raw.data), type: raw.type, data: raw.data, packedEntry: raw.packedEntry };
+      } else if (raw.baseOffset !== null) {
+        let base = baseCache.getByOffset(raw.baseOffset);
+        if (base === undefined) {
+          const baseRaw = rawByOffset.get(raw.baseOffset);
+          if (!baseRaw) throw new Error('ofs-delta base missing');
+          base = resolve(baseRaw);
+        }
+        const data = applyDelta(base.data, raw.data);
+        entry = { oid: hashObject(base.type, data), type: base.type, data, packedEntry: null };
+      } else {
+        const baseOid = raw.baseOid ?? '';
+        let baseType: ObjType;
+        let baseData: Buffer;
+        const cachedBase = baseCache.getByOid(baseOid);
+        if (cachedBase !== undefined) {
+          baseType = cachedBase.type;
+          baseData = cachedBase.data;
+        } else {
+          const existing = existingObjects?.get(baseOid);
+          if (existing !== undefined) {
+            baseType = existing.type;
+            baseData = existing.data;
+          } else {
+            const baseRaw = ensureRawByOid().get(baseOid);
+            if (!baseRaw) throw new Error('ref-delta base missing');
+            const b = resolve(baseRaw);
+            baseType = b.type;
+            baseData = b.data;
+          }
+        }
+        const data = applyDelta(baseData, raw.data);
+        entry = { oid: hashObject(baseType, data), type: baseType, data, packedEntry: null };
+      }
+    } finally {
+      seen.delete(raw.offset);
+    }
+    baseCache.put(raw.offset, entry);
+    return entry;
+  };
+
+  const out: PackEntry[] = new Array(raws.length);
+  for (let i = 0; i < raws.length; i++) {
+    const raw = raws[i];
+    // Fast path for non-delta objects: no recursion or seen-set manipulation needed.
+    if (raw.type !== null) {
+      let entry = baseCache.getByOffset(raw.offset);
+      if (entry === undefined) {
+        entry = { oid: hashObject(raw.type, raw.data), type: raw.type, data: raw.data, packedEntry: raw.packedEntry };
+        baseCache.put(raw.offset, entry);
+      }
+      out[i] = entry;
+    } else {
+      out[i] = resolve(raw);
+    }
+  }
+  baseCache.clear();
+  return out;
+}
+
+function readPack(buf: Buffer, existingObjects?: Map<string, GitObj>): PackEntry[] | Promise<PackEntry[]> {
   if (buf.length < 12 || buf.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('bad pack header');
   const version = buf.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error('bad pack version');
@@ -308,10 +528,12 @@ async function readPack(buf: Buffer): Promise<PackEntry[]> {
   if (trailerStart < 12) throw new Error('pack too short');
   const expect = sha1(buf.subarray(0, trailerStart));
   if (buf.subarray(trailerStart).toString('hex') !== expect) throw new Error('pack checksum mismatch');
-  interface Raw { offset: number; typeCode: number; type: ObjType | null; data: Buffer; baseOffset: number | null; baseOid: string | null; packedEntry: Buffer | null; }
-  const raws: Raw[] = [];
+
+  const raws: RawPackItem[] = [];
+  const rawByOffset = new Map<number, RawPackItem>();
   let off = 12;
-  for (let i = 0; i < count; i++) {
+
+  const parseEntryHeader = (): { start: number; typeCode: number; size: number; baseOffset: number | null; baseOid: string | null } => {
     const start = off;
     if (off >= trailerStart) throw new Error('pack truncated');
     let b = buf[off++];
@@ -340,53 +562,49 @@ async function readPack(buf: Buffer): Promise<PackEntry[]> {
       baseOid = buf.subarray(off, off + 20).toString('hex');
       off += 20;
     }
-    // The zlib stream is self-terminating; inflateEntry reports how many
-    // compressed bytes it consumed, so one inflate per object suffices.
-    const { data, consumed } = await inflateEntry(buf, off, size);
-    off += consumed;
-    const objType = PACK_TYPE_MAP[typeCode] ?? null;
-    // Non-delta objects: copy exact [varint(type, rawSize) + zlib bytes] slice
-    // so upload-pack can emit it directly with zero deflateSync calls, without
-    // retaining a reference to the entire incoming HTTP body buffer.
-    const packedEntry = objType !== null ? Buffer.from(buf.subarray(start, off)) : null;
-    raws.push({ offset: start, typeCode, type: objType, data, baseOffset, baseOid, packedEntry });
-  }
-  const byOffset = new Map<number, PackEntry>();
-  const byOid = new Map<string, PackEntry>();
-  const resolve = (raw: Raw, seen: Set<number>): PackEntry => {
-    const cached = byOffset.get(raw.offset);
-    if (cached) return cached;
-    if (seen.has(raw.offset)) throw new Error('delta cycle');
-    seen.add(raw.offset);
-    let entry: PackEntry;
-    if (raw.type !== null) {
-      entry = { oid: hashObject(raw.type, raw.data), type: raw.type, data: raw.data, packedEntry: raw.packedEntry };
-    } else if (raw.baseOffset !== null) {
-      const baseRaw = raws.find((r) => r.offset === raw.baseOffset);
-      if (!baseRaw) throw new Error('ofs-delta base missing');
-      const base = resolve(baseRaw, seen);
-      const data = applyDelta(base.data, raw.data);
-      entry = { oid: hashObject(base.type, data), type: base.type, data, packedEntry: null };
-    } else {
-      const base = byOid.get(raw.baseOid ?? '');
-      if (!base) {
-        const baseRaw = raws.find((r) => r.type !== null && hashObject(r.type, r.data) === raw.baseOid);
-        if (!baseRaw) throw new Error('ref-delta base missing');
-        const b = resolve(baseRaw, seen);
-        const data = applyDelta(b.data, raw.data);
-        entry = { oid: hashObject(b.type, data), type: b.type, data, packedEntry: null };
-      } else {
-        const data = applyDelta(base.data, raw.data);
-        entry = { oid: hashObject(base.type, data), type: base.type, data, packedEntry: null };
-      }
-    }
-    byOffset.set(raw.offset, entry);
-    byOid.set(entry.oid, entry);
-    return entry;
+    return { start, typeCode, size, baseOffset, baseOid };
   };
-  const out: PackEntry[] = [];
-  for (const raw of raws) out.push(resolve(raw, new Set()));
-  return out;
+
+  for (let i = 0; i < count; i++) {
+    const hdr = parseEntryHeader();
+    try {
+      const { data, consumed } = inflateEntrySync(buf, off, hdr.size);
+      off += consumed;
+      const objType = PACK_TYPE_MAP[hdr.typeCode] ?? null;
+      const packedEntry = objType !== null ? Buffer.from(buf.subarray(hdr.start, off)) : null;
+      const item: RawPackItem = {
+        offset: hdr.start, typeCode: hdr.typeCode, type: objType, data,
+        baseOffset: hdr.baseOffset, baseOid: hdr.baseOid, packedEntry,
+      };
+      raws.push(item);
+      rawByOffset.set(hdr.start, item);
+    } catch {
+      // Async streaming fallback from entry `i` onward (only for >= 2 MiB or edge streams).
+      return (async () => {
+        let curHdr = hdr;
+        for (let j = i; j < count; j++) {
+          if (j > i) curHdr = parseEntryHeader();
+          let res: { data: Buffer; consumed: number };
+          try {
+            res = inflateEntrySync(buf, off, curHdr.size);
+          } catch {
+            res = await inflateEntryStream(buf, off, curHdr.size);
+          }
+          off += res.consumed;
+          const objType = PACK_TYPE_MAP[curHdr.typeCode] ?? null;
+          const packedEntry = objType !== null ? Buffer.from(buf.subarray(curHdr.start, off)) : null;
+          const item: RawPackItem = {
+            offset: curHdr.start, typeCode: curHdr.typeCode, type: objType, data: res.data,
+            baseOffset: curHdr.baseOffset, baseOid: curHdr.baseOid, packedEntry,
+          };
+          raws.push(item);
+          rawByOffset.set(curHdr.start, item);
+        }
+        return resolvePackRaws(raws, rawByOffset, existingObjects);
+      })();
+    }
+  }
+  return resolvePackRaws(raws, rawByOffset, existingObjects);
 }
 
 function writePack(entries: PackEntry[]): Buffer {
@@ -426,6 +644,357 @@ function writePack(entries: PackEntry[]): Buffer {
   return out;
 }
 
+// ---------------------------------------------------------------- commit graph (SoA TypedArrays)
+
+interface CommitMeta { tree: string; parents: string[]; commitDate: number; }
+
+/**
+ * Lazy commit header scanner: reads only tree OID, parent OIDs, and committer
+ * unix timestamp directly from raw bytes via indexOf(0x0a), avoiding UTF-8
+ * decoding of author/email/message until REST or GraphQL requests them.
+ */
+function scanCommitMeta(data: Buffer): CommitMeta {
+  let tree = '';
+  const parents: string[] = [];
+  let commitDate = FIXED_EPOCH;
+  const len = data.length;
+  let pos = 0;
+  while (pos < len) {
+    const nl = data.indexOf(0x0a, pos);
+    const lineEnd = nl < 0 ? len : nl;
+    if (lineEnd === pos) break; // blank line terminates commit headers
+    const lineLen = lineEnd - pos;
+    const b0 = data[pos];
+    if (b0 === 0x74 /* 't' */ && lineLen >= 45 && data[pos + 1] === 0x72 && data[pos + 2] === 0x65 && data[pos + 3] === 0x65 && data[pos + 4] === 0x20) {
+      tree = data.subarray(pos + 5, pos + 45).toString('latin1');
+    } else if (b0 === 0x70 /* 'p' */ && lineLen >= 47 && data[pos + 1] === 0x61 && data[pos + 2] === 0x72 && data[pos + 3] === 0x65 && data[pos + 4] === 0x6e && data[pos + 5] === 0x74 && data[pos + 6] === 0x20) {
+      parents.push(data.subarray(pos + 7, pos + 47).toString('latin1'));
+    } else if (b0 === 0x63 /* 'c' */ && lineLen > 12 && data[pos + 1] === 0x6f && data[pos + 2] === 0x6d && data[pos + 3] === 0x6d && data[pos + 4] === 0x69 && data[pos + 5] === 0x74 && data[pos + 6] === 0x74 && data[pos + 7] === 0x65 && data[pos + 8] === 0x72 && data[pos + 9] === 0x20) {
+      // Parse `<timestamp> <tz>` at the end of the committer line without allocations.
+      let tzSp = lineEnd - 1;
+      while (tzSp > pos && data[tzSp] !== 0x20) tzSp--;
+      if (tzSp > pos) {
+        let tsStart = tzSp - 1;
+        while (tsStart > pos && data[tsStart - 1] !== 0x20) tsStart--;
+        if (tsStart < tzSp) {
+          let ts = 0;
+          let valid = true;
+          for (let i = tsStart; i < tzSp; i++) {
+            const d = data[i] - 48;
+            if (d < 0 || d > 9) { valid = false; break; }
+            ts = ts * 10 + d;
+          }
+          if (valid) commitDate = ts;
+        }
+      }
+    }
+    if (nl < 0) break;
+    pos = nl + 1;
+  }
+  return { tree, parents, commitDate };
+}
+
+class CommitGraph {
+  oidToId = new Map<string, number>();
+  idToOid: string[] = [];
+  treeOids: string[] = [];
+  parent1: Int32Array;
+  parent2: Int32Array;
+  extraParents: Int32Array[] = [];
+  commitDate: Float64Array;
+  gen: Float64Array;
+  visitStamp: Uint32Array;
+  walkEpoch = 0;
+  count = 0;
+  private capacity = 256;
+  private pendingParents = new Map<number, string[]>();
+  private walkStack: number[] = [];
+
+  constructor() {
+    const cap = this.capacity;
+    this.parent1 = new Int32Array(cap).fill(-1);
+    this.parent2 = new Int32Array(cap).fill(-1);
+    this.commitDate = new Float64Array(cap);
+    this.gen = new Float64Array(cap);
+    this.visitStamp = new Uint32Array(cap);
+  }
+
+  private grow(): void {
+    const nextCap = this.capacity * 2;
+    const p1 = new Int32Array(nextCap).fill(-1);
+    p1.set(this.parent1);
+    this.parent1 = p1;
+    const p2 = new Int32Array(nextCap).fill(-1);
+    p2.set(this.parent2);
+    this.parent2 = p2;
+    const cd = new Float64Array(nextCap);
+    cd.set(this.commitDate);
+    this.commitDate = cd;
+    const g = new Float64Array(nextCap);
+    g.set(this.gen);
+    this.gen = g;
+    const vs = new Uint32Array(nextCap);
+    vs.set(this.visitStamp);
+    this.visitStamp = vs;
+    this.capacity = nextCap;
+  }
+
+  private linkResolvedParents(id: number, parentIds: number[]): void {
+    if (parentIds.length === 0) {
+      this.parent1[id] = -1;
+      this.parent2[id] = -1;
+    } else if (parentIds.length === 1) {
+      this.parent1[id] = parentIds[0];
+      this.parent2[id] = -1;
+    } else if (parentIds.length === 2) {
+      this.parent1[id] = parentIds[0];
+      this.parent2[id] = parentIds[1];
+    } else {
+      this.parent1[id] = parentIds[0];
+      const idx = this.extraParents.length;
+      this.extraParents.push(Int32Array.from(parentIds));
+      this.parent2[id] = -(idx + 2);
+    }
+  }
+
+  addCommit(oid: string, data: Buffer): number {
+    const existing = this.oidToId.get(oid);
+    if (existing !== undefined) return existing;
+    if (this.count === this.capacity) this.grow();
+    const meta = scanCommitMeta(data);
+    const id = this.count++;
+    this.oidToId.set(oid, id);
+    this.idToOid.push(oid);
+    this.treeOids.push(meta.tree);
+    this.commitDate[id] = meta.commitDate;
+
+    const pLen = meta.parents.length;
+    if (pLen === 0) {
+      this.parent1[id] = -1;
+      this.parent2[id] = -1;
+      this.gen[id] = meta.commitDate;
+      return id;
+    }
+    if (pLen === 1) {
+      const pid = this.oidToId.get(meta.parents[0]);
+      if (pid !== undefined) {
+        this.parent1[id] = pid;
+        this.parent2[id] = -1;
+        const pg = this.gen[pid];
+        this.gen[id] = Number.isFinite(pg) ? Math.max(meta.commitDate, pg + 1) : Infinity;
+        return id;
+      }
+      this.parent1[id] = -1;
+      this.parent2[id] = -1;
+      this.gen[id] = Infinity;
+      this.pendingParents.set(id, meta.parents);
+      return id;
+    }
+    const resolvedIds: number[] = new Array(pLen);
+    let allFound = true;
+    let maxParentGen = -Infinity;
+    for (let i = 0; i < pLen; i++) {
+      const pid = this.oidToId.get(meta.parents[i]);
+      if (pid === undefined) { allFound = false; break; }
+      resolvedIds[i] = pid;
+      const pg = this.gen[pid];
+      if (!Number.isFinite(pg)) maxParentGen = Infinity;
+      else if (pg > maxParentGen) maxParentGen = pg;
+    }
+    if (allFound) {
+      this.linkResolvedParents(id, resolvedIds);
+      this.gen[id] = Number.isFinite(maxParentGen) ? Math.max(meta.commitDate, maxParentGen + 1) : Infinity;
+    } else {
+      this.parent1[id] = -1;
+      this.parent2[id] = -1;
+      this.gen[id] = Infinity;
+      this.pendingParents.set(id, meta.parents);
+    }
+    return id;
+  }
+
+  /** Link out-of-order commits after a pack completes and finalize topological generation numbers. */
+  finalizePending(): void {
+    if (this.pendingParents.size === 0) return;
+    const newlyResolved: number[] = [];
+    for (const [id, pOids] of this.pendingParents) {
+      const resolvedIds: number[] = [];
+      let allFound = true;
+      for (let i = 0; i < pOids.length; i++) {
+        const pid = this.oidToId.get(pOids[i]);
+        if (pid === undefined) { allFound = false; break; }
+        resolvedIds.push(pid);
+      }
+      if (allFound) {
+        this.linkResolvedParents(id, resolvedIds);
+        this.pendingParents.delete(id);
+        newlyResolved.push(id);
+      }
+    }
+    if (newlyResolved.length === 0) return;
+    // Compute generation numbers in topological order for all commits with gen === Infinity
+    // that have no unresolved (graft/shallow) ancestor.
+    const state = new Uint8Array(this.count); // 0=unvisited, 1=visiting, 2=done
+    const computeGen = (startId: number): void => {
+      const stack: number[] = [startId];
+      while (stack.length > 0) {
+        const u = stack[stack.length - 1];
+        if (state[u] === 2) { stack.pop(); continue; }
+        if (this.pendingParents.has(u)) {
+          this.gen[u] = Infinity;
+          state[u] = 2;
+          stack.pop();
+          continue;
+        }
+        const p1 = this.parent1[u];
+        const p2 = this.parent2[u];
+        if (state[u] === 0) {
+          state[u] = 1;
+          if (p2 < -1) {
+            const arr = this.extraParents[-(p2 + 2)];
+            for (let i = 0; i < arr.length; i++) {
+              const p = arr[i];
+              if (!Number.isFinite(this.gen[p]) && state[p] === 0) stack.push(p);
+            }
+          } else {
+            if (p1 >= 0 && !Number.isFinite(this.gen[p1]) && state[p1] === 0) stack.push(p1);
+            if (p2 >= 0 && !Number.isFinite(this.gen[p2]) && state[p2] === 0) stack.push(p2);
+          }
+        } else {
+          stack.pop();
+          state[u] = 2;
+          let maxPg = -Infinity;
+          if (p2 < -1) {
+            const arr = this.extraParents[-(p2 + 2)];
+            for (let i = 0; i < arr.length; i++) {
+              const pg = this.gen[arr[i]];
+              if (!Number.isFinite(pg)) { maxPg = Infinity; break; }
+              if (pg > maxPg) maxPg = pg;
+            }
+          } else {
+            if (p1 >= 0) {
+              const pg = this.gen[p1];
+              if (!Number.isFinite(pg)) maxPg = Infinity;
+              else if (pg > maxPg) maxPg = pg;
+            }
+            if (p2 >= 0 && Number.isFinite(maxPg)) {
+              const pg = this.gen[p2];
+              if (!Number.isFinite(pg)) maxPg = Infinity;
+              else if (pg > maxPg) maxPg = pg;
+            }
+          }
+          if (p1 < 0 && p2 === -1) this.gen[u] = this.commitDate[u];
+          else this.gen[u] = Number.isFinite(maxPg) ? Math.max(this.commitDate[u], maxPg + 1) : Infinity;
+        }
+      }
+    };
+    for (let id = 0; id < this.count; id++) {
+      if (!Number.isFinite(this.gen[id]) && !this.pendingParents.has(id) && state[id] === 0) {
+        computeGen(id);
+      }
+    }
+  }
+
+  private nextEpoch(): number {
+    if (++this.walkEpoch >= 0xffffffff) {
+      this.visitStamp.fill(0);
+      this.walkEpoch = 1;
+    }
+    return this.walkEpoch;
+  }
+
+  getTreeOid(oid: string): string | undefined {
+    const id = this.oidToId.get(oid);
+    return id !== undefined ? this.treeOids[id] : undefined;
+  }
+
+  getParents(oid: string): string[] | undefined {
+    const id = this.oidToId.get(oid);
+    if (id === undefined) return undefined;
+    const pending = this.pendingParents.get(id);
+    if (pending !== undefined) return pending;
+    const p1 = this.parent1[id];
+    if (p1 < 0) return [];
+    const p2 = this.parent2[id];
+    if (p2 === -1) return [this.idToOid[p1]];
+    if (p2 >= 0) return [this.idToOid[p1], this.idToOid[p2]];
+    const arr = this.extraParents[-(p2 + 2)];
+    const out: string[] = new Array(arr.length);
+    for (let i = 0; i < arr.length; i++) out[i] = this.idToOid[arr[i]];
+    return out;
+  }
+
+  /** O(1) fast-forward check + generation-v2 pruned walk using visitStamp/walkEpoch (no Set). */
+  isAncestor(ancOid: string, descOid: string): boolean | null {
+    const ancId = this.oidToId.get(ancOid);
+    const descId = this.oidToId.get(descOid);
+    if (ancId === undefined || descId === undefined) return null;
+    if (ancId === descId) return true;
+    // O(1) fast-forward check on direct parent1 / parent2.
+    if (this.parent1[descId] === ancId) return true;
+    const dp2 = this.parent2[descId];
+    if (dp2 === ancId) return true;
+    // Generation v2 pruning: never prunes when gen is Infinity (shallow/graft boundary).
+    const ancGen = this.gen[ancId];
+    const canPrune = Number.isFinite(ancGen);
+    if (canPrune && this.gen[descId] <= ancGen) return false;
+
+    const epoch = this.nextEpoch();
+    const visit = this.visitStamp;
+    const genArr = this.gen;
+    const p1Arr = this.parent1;
+    const p2Arr = this.parent2;
+    const stack = this.walkStack;
+    stack.length = 0;
+    visit[descId] = epoch;
+    stack.push(descId);
+
+    while (stack.length > 0) {
+      const u = stack.pop() as number;
+      const p1 = p1Arr[u];
+      const p2 = p2Arr[u];
+      if (p2 < -1) {
+        const arr = this.extraParents[-(p2 + 2)];
+        for (let i = 0; i < arr.length; i++) {
+          const p = arr[i];
+          if (p === ancId) { stack.length = 0; return true; }
+          if (visit[p] !== epoch && !(canPrune && genArr[p] <= ancGen)) {
+            visit[p] = epoch;
+            stack.push(p);
+          }
+        }
+      } else if (p1 >= 0) {
+        if (p1 === ancId) { stack.length = 0; return true; }
+        if (visit[p1] !== epoch && !(canPrune && genArr[p1] <= ancGen)) {
+          visit[p1] = epoch;
+          stack.push(p1);
+        }
+        if (p2 >= 0) {
+          if (p2 === ancId) { stack.length = 0; return true; }
+          if (visit[p2] !== epoch && !(canPrune && genArr[p2] <= ancGen)) {
+            visit[p2] = epoch;
+            stack.push(p2);
+          }
+        }
+      } else if (this.pendingParents.size > 0) {
+        const pend = this.pendingParents.get(u);
+        if (pend !== undefined) {
+          for (let i = 0; i < pend.length; i++) {
+            const pid = this.oidToId.get(pend[i]);
+            if (pid === undefined) continue;
+            if (pid === ancId) { stack.length = 0; return true; }
+            if (visit[pid] !== epoch && !(canPrune && genArr[pid] <= ancGen)) {
+              visit[pid] = epoch;
+              stack.push(pid);
+            }
+          }
+        }
+      }
+    }
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------- store
 
 interface Label { id: number; name: string; color: string; description: string; }
@@ -445,6 +1014,7 @@ interface Pull {
 interface Repo {
   id: number; name: string; owner: string; description: string; isPrivate: boolean;
   defaultBranch: string; refs: Map<string, string>; objects: Map<string, GitObj>;
+  graph: CommitGraph;
   issues: Map<number, Issue>; pulls: Map<number, Pull>; labels: Map<string, Label>;
   seq: number; createdSeq: number;
 }
@@ -479,7 +1049,7 @@ function decodeGlobalId(id: string): { kind: string; parts: string[] } | null {
 function createRepoRecord(name: string, isPrivate: boolean, description: string): Repo {
   const repo: Repo = {
     id: repoIdSeq++, name, owner: VIEWER_LOGIN, description, isPrivate,
-    defaultBranch: 'main', refs: new Map(), objects: new Map(),
+    defaultBranch: 'main', refs: new Map(), objects: new Map(), graph: new CommitGraph(),
     issues: new Map(), pulls: new Map(), labels: new Map(), seq: 0, createdSeq: globalSeq++,
   };
   repos.set(repoKey(repo.owner, name), repo);
@@ -490,7 +1060,10 @@ function createRepoRecord(name: string, isPrivate: boolean, description: string)
 // object helpers bound to a repo
 function putObj(repo: Repo, type: ObjType, data: Buffer): string {
   const oid = hashObject(type, data);
-  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data, packedEntry: null });
+  if (!repo.objects.has(oid)) {
+    repo.objects.set(oid, { type, data, packedEntry: null });
+    if (type === 'commit') repo.graph.addCommit(oid, data);
+  }
   return oid;
 }
 function getObj(repo: Repo, oid: string): GitObj | undefined {
@@ -576,14 +1149,18 @@ function makeCommit(repo: Repo, treeOid: string, parents: string[], message: str
   return putObj(repo, 'commit', buildCommit(treeOid, parents, message));
 }
 function commitParents(repo: Repo, oid: string): string[] {
+  const cached = repo.graph.getParents(oid);
+  if (cached !== undefined) return cached;
   const obj = getObj(repo, oid);
   if (!obj || obj.type !== 'commit') return [];
-  return parseCommit(obj.data).parents;
+  return scanCommitMeta(obj.data).parents;
 }
 function commitTreeOid(repo: Repo, oid: string): string {
+  const cached = repo.graph.getTreeOid(oid);
+  if (cached !== undefined) return cached;
   const obj = getObj(repo, oid);
   if (!obj || obj.type !== 'commit') return '';
-  return parseCommit(obj.data).tree;
+  return scanCommitMeta(obj.data).tree;
 }
 function peelToCommit(repo: Repo, oid: string): string {
   let cur = oid;
@@ -602,10 +1179,16 @@ function commitClosure(repo: Repo, tips: string[]): Set<string> {
   while (stack.length) {
     const oid = stack.pop() as string;
     if (out.has(oid)) continue;
+    const parents = repo.graph.getParents(oid);
+    if (parents !== undefined) {
+      out.add(oid);
+      for (let i = 0; i < parents.length; i++) stack.push(parents[i]);
+      continue;
+    }
     const obj = getObj(repo, oid);
     if (!obj || obj.type !== 'commit') continue;
     out.add(oid);
-    for (const p of parseCommit(obj.data).parents) stack.push(p);
+    for (const p of scanCommitMeta(obj.data).parents) stack.push(p);
   }
   return out;
 }
@@ -619,9 +1202,9 @@ function fullClosure(repo: Repo, tips: string[]): Set<string> {
     if (!obj) continue;
     out.add(oid);
     if (obj.type === 'commit') {
-      const c = parseCommit(obj.data);
-      stack.push(c.tree);
-      for (const p of c.parents) stack.push(p);
+      const tree = commitTreeOid(repo, oid);
+      if (tree) stack.push(tree);
+      for (const p of commitParents(repo, oid)) stack.push(p);
     } else if (obj.type === 'tree') {
       for (const e of parseTree(obj.data)) stack.push(e.oid);
     } else if (obj.type === 'tag') {
@@ -632,6 +1215,8 @@ function fullClosure(repo: Repo, tips: string[]): Set<string> {
 }
 function isAncestor(repo: Repo, anc: string, desc: string): boolean {
   if (anc === desc) return true;
+  const graphResult = repo.graph.isAncestor(anc, desc);
+  if (graphResult !== null) return graphResult;
   const seen = new Set<string>();
   const stack = [desc];
   while (stack.length) {
@@ -667,7 +1252,7 @@ function listCommits(repo: Repo, tip: string): string[] {
     const obj = getObj(repo, oid);
     if (!obj || obj.type !== 'commit') continue;
     out.push(oid);
-    const parents = parseCommit(obj.data).parents;
+    const parents = commitParents(repo, oid);
     for (let i = parents.length - 1; i >= 0; i--) stack.push(parents[i]);
   }
   return out;
@@ -1204,9 +1789,9 @@ function closureWithShallow(repo: Repo, tips: string[], shallow: Set<string>): S
     if (!obj) continue;
     out.add(oid);
     if (obj.type === 'commit') {
-      const c = parseCommit(obj.data);
-      stack.push(c.tree);
-      if (!shallow.has(oid)) for (const p of c.parents) stack.push(p);
+      const tree = commitTreeOid(repo, oid);
+      if (tree) stack.push(tree);
+      if (!shallow.has(oid)) for (const p of commitParents(repo, oid)) stack.push(p);
     } else if (obj.type === 'tree') {
       for (const e of parseTree(obj.data)) stack.push(e.oid);
     } else if (obj.type === 'tag') {
@@ -1272,7 +1857,7 @@ function selectFetch(repo: Repo, args: FetchArgs): { objects: PackEntry[]; shall
         const obj = getObj(repo, c);
         if (!obj || obj.type !== 'commit') continue;
         D.add(c);
-        for (const p of parseCommit(obj.data).parents) next.push(p);
+        for (const p of commitParents(repo, c)) next.push(p);
       }
       frontier = next;
     }
@@ -1491,10 +2076,20 @@ async function receivePackResponse(repo: Repo, body: Buffer): Promise<Buffer> {
   let unpackError: string | null = null;
   if (rawPack.length > 0) {
     try {
-      const entries = await readPack(rawPack);
-      for (const e of entries) {
-        if (!repo.objects.has(e.oid)) repo.objects.set(e.oid, { type: e.type, data: e.data, packedEntry: e.packedEntry ?? null });
+      const parsed = readPack(rawPack, repo.objects);
+      const entries = Array.isArray(parsed) ? parsed : await parsed;
+      let addedCommit = false;
+      for (let i = 0; i < entries.length; i++) {
+        const e = entries[i];
+        if (!repo.objects.has(e.oid)) {
+          repo.objects.set(e.oid, { type: e.type, data: e.data, packedEntry: e.packedEntry ?? null });
+          if (e.type === 'commit') {
+            repo.graph.addCommit(e.oid, e.data);
+            addedCommit = true;
+          }
+        }
       }
+      if (addedCommit) repo.graph.finalizePending();
     } catch (err) {
       unpackError = err instanceof Error ? err.message : 'unpack failed';
     }
@@ -1515,10 +2110,13 @@ async function receivePackResponse(repo: Repo, body: Buffer): Promise<Buffer> {
       } else if (c.oldOid === ZERO_OID) {
         if (current !== undefined) lines.push(`ng ${c.ref} non-fast-forward\n`);
         else { repo.refs.set(c.ref, c.newOid); lines.push(`ok ${c.ref}\n`); }
+      } else if (current === undefined || current !== c.oldOid) {
+        lines.push(`ng ${c.ref} non-fast-forward\n`);
+      } else if (c.oldOid === c.newOid || isAncestor(repo, c.oldOid, c.newOid)) {
+        repo.refs.set(c.ref, c.newOid);
+        lines.push(`ok ${c.ref}\n`);
       } else {
-        if (current === undefined || current !== c.oldOid) lines.push(`ng ${c.ref} non-fast-forward\n`);
-        else if (isAncestor(repo, c.oldOid, c.newOid)) { repo.refs.set(c.ref, c.newOid); lines.push(`ok ${c.ref}\n`); }
-        else lines.push(`ng ${c.ref} non-fast-forward\n`);
+        lines.push(`ng ${c.ref} non-fast-forward\n`);
       }
     }
   }
