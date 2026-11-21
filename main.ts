@@ -1002,10 +1002,13 @@ interface Comment { id: number; body: string; }
 interface Issue {
   id: number; number: number; title: string; body: string;
   state: 'open' | 'closed'; labels: string[]; comments: Comment[]; seq: number;
-  // Serialized REST form, built once and served verbatim until the issue
-  // mutates (the read workload GETs one issue 2,000 times in a row).
-  cached: Buffer | null;
+  rev: number;
+  etag: string;
+  // Serialized REST form with trailing '\n', built once and served verbatim until
+  // the issue mutates; list serialization slices [0, length - 1) zero-copy.
+  jsonBuf: Buffer | null;
 }
+interface IssueListCacheEntry { buf: Buffer; link: string | null; etag: string; }
 interface Pull {
   id: number; number: number; title: string; body: string;
   state: 'open' | 'closed'; merged: boolean; mergedAt: string | null; mergeSha: string | null;
@@ -1015,7 +1018,13 @@ interface Repo {
   id: number; name: string; owner: string; description: string; isPrivate: boolean;
   defaultBranch: string; refs: Map<string, string>; objects: Map<string, GitObj>;
   graph: CommitGraph;
-  issues: Map<number, Issue>; pulls: Map<number, Pull>; labels: Map<string, Label>;
+  issues: Map<number, Issue>;
+  openIssues: Issue[];
+  closedIssues: Issue[];
+  allIssues: Issue[];
+  issuesVersion: number;
+  issueListCache: Map<string, IssueListCacheEntry>;
+  pulls: Map<number, Pull>; labels: Map<string, Label>;
   seq: number; createdSeq: number;
 }
 
@@ -1050,11 +1059,65 @@ function createRepoRecord(name: string, isPrivate: boolean, description: string)
   const repo: Repo = {
     id: repoIdSeq++, name, owner: VIEWER_LOGIN, description, isPrivate,
     defaultBranch: 'main', refs: new Map(), objects: new Map(), graph: new CommitGraph(),
-    issues: new Map(), pulls: new Map(), labels: new Map(), seq: 0, createdSeq: globalSeq++,
+    issues: new Map(), openIssues: [], closedIssues: [], allIssues: [],
+    issuesVersion: 1, issueListCache: new Map(),
+    pulls: new Map(), labels: new Map(), seq: 0, createdSeq: globalSeq++,
   };
   repos.set(repoKey(repo.owner, name), repo);
   reposById.set(repo.id, repo);
   return repo;
+}
+
+function insertIssueSortedBySeq(arr: Issue[], issue: Issue): void {
+  let lo = 0;
+  let hi = arr.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (arr[mid].seq < issue.seq) lo = mid + 1;
+    else hi = mid;
+  }
+  arr.splice(lo, 0, issue);
+}
+function removeIssueFromSorted(arr: Issue[], issue: Issue): void {
+  let lo = 0;
+  let hi = arr.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (arr[mid].seq < issue.seq) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo < arr.length && arr[lo] === issue) arr.splice(lo, 1);
+}
+function createIssueRecord(repo: Repo, title: string, body: string, labelNames: string[]): Issue {
+  const number = ++repo.seq;
+  const issue: Issue = {
+    id: objIdSeq++, number, title, body,
+    state: 'open', labels: labelNames, comments: [], seq: globalSeq++,
+    rev: 1, etag: `W/"i-${number}-v1"`, jsonBuf: null,
+  };
+  repo.issues.set(number, issue);
+  repo.openIssues.push(issue);
+  repo.allIssues.push(issue);
+  repo.issuesVersion++;
+  if (repo.issueListCache.size > 0) repo.issueListCache.clear();
+  return issue;
+}
+/** Single mutation choke-point: keeps issue JSON cache, list index, list cache, and ETag strictly in sync. */
+function invalidateIssue(repo: Repo, issue: Issue, prevState?: 'open' | 'closed'): void {
+  if (prevState !== undefined && prevState !== issue.state) {
+    if (prevState === 'open') {
+      removeIssueFromSorted(repo.openIssues, issue);
+      insertIssueSortedBySeq(repo.closedIssues, issue);
+    } else {
+      removeIssueFromSorted(repo.closedIssues, issue);
+      insertIssueSortedBySeq(repo.openIssues, issue);
+    }
+  }
+  issue.jsonBuf = null;
+  issue.rev++;
+  issue.etag = `W/"i-${issue.number}-v${issue.rev}"`;
+  repo.issuesVersion++;
+  if (repo.issueListCache.size > 0) repo.issueListCache.clear();
 }
 
 // object helpers bound to a repo
@@ -1337,46 +1400,210 @@ function squashMerge(repo: Repo, pull: Pull): { ok: boolean; sha?: string; reaso
 
 // ---------------------------------------------------------------- http plumbing
 
+const EMPTY_BUF = Buffer.alloc(0);
+const EXPECTED_BEARER = TOKEN !== '' ? `Bearer ${TOKEN}` : '';
+const EXPECTED_TOKEN = TOKEN !== '' ? `token ${TOKEN}` : '';
+
 function readBody(req: IncomingMessage): Promise<Buffer> {
+  const te = req.headers['transfer-encoding'];
+  const cl = req.headers['content-length'];
+  if (te === undefined && (cl === undefined || cl === '0')) {
+    return Promise.resolve(EMPTY_BUF);
+  }
   return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
+    let first: Buffer | null = null;
+    let chunks: Buffer[] | null = null;
     let total = 0;
     req.on('data', (c: Buffer) => {
       total += c.length;
       if (total > 64 * 1024 * 1024) { reject(new Error('body too large')); req.destroy(); return; }
-      chunks.push(c);
+      if (first === null) {
+        first = c;
+      } else if (chunks === null) {
+        chunks = [first, c];
+      } else {
+        chunks.push(c);
+      }
     });
-    req.on('end', () => resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks)));
+    req.on('end', () => {
+      if (chunks !== null) resolve(Buffer.concat(chunks, total));
+      else resolve(first !== null ? first : EMPTY_BUF);
+    });
     req.on('error', reject);
   });
 }
-function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
+function sendJson(res: ServerResponse, status: number, body: unknown, extra?: Record<string, string>): void {
   const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(text),
-    'x-github-request-id': `req-${reqSeq++}`,
-    ...extra,
-  });
+  if (extra === undefined) {
+    res.writeHead(status, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-length': Buffer.byteLength(text),
+      'x-github-request-id': `req-${reqSeq++}`,
+    });
+  } else {
+    res.writeHead(status, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-length': Buffer.byteLength(text),
+      'x-github-request-id': `req-${reqSeq++}`,
+      ...extra,
+    });
+  }
   res.end(text);
 }
 /** sendJson for a pre-serialized buffer (same headers, no re-stringify). */
-function sendJsonBuf(res: ServerResponse, status: number, buf: Buffer, extra: Record<string, string> = {}): void {
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': buf.length,
-    'x-github-request-id': `req-${reqSeq++}`,
-    ...extra,
-  });
+function sendJsonBuf(res: ServerResponse, status: number, buf: Buffer, extra?: Record<string, string>): void {
+  if (extra === undefined) {
+    res.writeHead(status, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-length': buf.length,
+      'x-github-request-id': `req-${reqSeq++}`,
+    });
+  } else {
+    res.writeHead(status, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-length': buf.length,
+      'x-github-request-id': `req-${reqSeq++}`,
+      ...extra,
+    });
+  }
   res.end(buf);
 }
-function sendRaw(res: ServerResponse, status: number, buf: Buffer, contentType: string, extra: Record<string, string> = {}): void {
-  res.writeHead(status, { 'content-type': contentType, 'content-length': buf.length, ...extra });
+function sendJsonBufFast(res: ServerResponse, status: number, buf: Buffer, etag: string, link: string | null, isHead: boolean): void {
+  if (link === null) {
+    res.writeHead(status, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-length': buf.length,
+      'x-github-request-id': `req-${reqSeq++}`,
+      etag,
+    });
+  } else {
+    res.writeHead(status, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-length': buf.length,
+      'x-github-request-id': `req-${reqSeq++}`,
+      etag,
+      link,
+    });
+  }
+  if (isHead) res.end();
+  else res.end(buf);
+}
+function sendNotModified(res: ServerResponse, etag: string): void {
+  res.writeHead(304, {
+    etag,
+    'x-github-request-id': `req-${reqSeq++}`,
+  });
+  res.end();
+}
+function sendRaw(res: ServerResponse, status: number, buf: Buffer, contentType: string, extra?: Record<string, string>): void {
+  if (extra === undefined) {
+    res.writeHead(status, { 'content-type': contentType, 'content-length': buf.length });
+  } else {
+    res.writeHead(status, { 'content-type': contentType, 'content-length': buf.length, ...extra });
+  }
   res.end(buf);
 }
 function sendNoContent(res: ServerResponse, status: number): void {
   res.writeHead(status, { 'x-github-request-id': `req-${reqSeq++}` });
   res.end();
+}
+/** RFC 9110 weak ETag comparison for If-None-Match (handles W/, '*', comma-separated list). */
+function etagMatches(inm: string | string[] | undefined, currentEtag: string): boolean {
+  if (inm === undefined) return false;
+  const header = Array.isArray(inm) ? inm.join(',') : inm;
+  const len = header.length;
+  if (len === 0) return false;
+  const curOpaque = currentEtag.startsWith('W/') ? currentEtag.slice(2) : currentEtag;
+  let pos = 0;
+  while (pos < len) {
+    let comma = header.indexOf(',', pos);
+    if (comma < 0) comma = len;
+    let s = pos;
+    let e = comma;
+    while (s < e && (header.charCodeAt(s) === 32 || header.charCodeAt(s) === 9)) s++;
+    while (e > s && (header.charCodeAt(e - 1) === 32 || header.charCodeAt(e - 1) === 9)) e--;
+    if (e - s === 1 && header.charCodeAt(s) === 42 /* '*' */) return true;
+    if (e - s >= 2 && header.charCodeAt(s) === 87 /* 'W' */ && header.charCodeAt(s + 1) === 47 /* '/' */) s += 2;
+    if (e - s === curOpaque.length && header.slice(s, e) === curOpaque) return true;
+    pos = comma + 1;
+  }
+  return false;
+}
+function isGitProtoV2(req: IncomingMessage): boolean {
+  const gp = req.headers['git-protocol'];
+  if (gp === undefined) return false;
+  const s = Array.isArray(gp) ? gp.join(':') : gp;
+  if (s === 'version=2') return true;
+  let pos = 0;
+  while (pos < s.length) {
+    let next = s.indexOf(':', pos);
+    if (next < 0) next = s.length;
+    if (next - pos === 9 && s.slice(pos, next) === 'version=2') return true;
+    pos = next + 1;
+  }
+  return false;
+}
+function decodeSeg(s: string): string {
+  if (s.indexOf('%') < 0) return s;
+  try { return decodeURIComponent(s); } catch { return s; }
+}
+function decodeQueryVal(s: string): string {
+  if (s.indexOf('%') < 0 && s.indexOf('+') < 0) return s;
+  const rep = s.indexOf('+') >= 0 ? s.replace(/\+/g, ' ') : s;
+  if (rep.indexOf('%') < 0) return rep;
+  try { return decodeURIComponent(rep); } catch { return rep; }
+}
+function parseUintAscii(s: string, start: number, end: number): number {
+  if (start >= end) return -1;
+  let v = 0;
+  for (let i = start; i < end; i++) {
+    const d = s.charCodeAt(i) - 48;
+    if (d < 0 || d > 9) return -1;
+    v = v * 10 + d;
+  }
+  return v;
+}
+interface IssueListQuery {
+  state: string;
+  direction: string;
+  sort: string;
+  labels: string;
+  page: number;
+  perPage: number;
+  rawQs: string;
+}
+function parseIssueListQuery(qs: string): IssueListQuery {
+  let state = 'open';
+  let direction = 'desc';
+  let sort = 'created';
+  let labels = '';
+  let page = 1;
+  let perPage = 30;
+  let pos = 0;
+  const len = qs.length;
+  while (pos < len) {
+    let amp = qs.indexOf('&', pos);
+    if (amp < 0) amp = len;
+    if (amp > pos) {
+      const eq = qs.indexOf('=', pos);
+      const keyEnd = eq >= 0 && eq < amp ? eq : amp;
+      const key = qs.slice(pos, keyEnd);
+      const val = eq >= 0 && eq < amp ? qs.slice(eq + 1, amp) : '';
+      if (key === 'state') state = decodeQueryVal(val);
+      else if (key === 'direction') direction = decodeQueryVal(val);
+      else if (key === 'sort') sort = decodeQueryVal(val);
+      else if (key === 'labels') labels = decodeQueryVal(val);
+      else if (key === 'page') {
+        const n = parseInt(val, 10);
+        if (n > 0) page = n;
+      } else if (key === 'per_page') {
+        const n = parseInt(val, 10);
+        if (n > 0) perPage = n > 100 ? 100 : n;
+      }
+    }
+    pos = amp + 1;
+  }
+  return { state, direction, sort, labels, page, perPage, rawQs: qs };
 }
 function pathOf(req: IncomingMessage): string {
   // The request-target is origin-form here; split off the query by hand
@@ -1386,7 +1613,7 @@ function pathOf(req: IncomingMessage): string {
   const qi = raw.indexOf('?');
   let p = qi >= 0 ? raw.slice(0, qi) : raw;
   if (p === '') p = '/';
-  if (p.includes('%')) {
+  if (p.indexOf('%') >= 0) {
     try { p = decodeURIComponent(p); } catch { /* keep raw */ }
   }
   return p;
@@ -1401,11 +1628,17 @@ function queryOf(req: IncomingMessage): URLSearchParams {
 }
 type AuthResult = 'ok' | 'missing' | 'wrong';
 function checkAuth(req: IncomingMessage): AuthResult {
-  const h = req.headers.authorization ?? '';
-  if (!h.startsWith('Bearer ')) return 'missing';
-  const tok = h.slice('Bearer '.length);
-  if (tok === '') return 'missing';
-  if (TOKEN !== '' && tok !== TOKEN) return 'wrong';
+  const h = req.headers.authorization;
+  if (typeof h !== 'string' || h.length === 0) return 'missing';
+  if (TOKEN !== '') {
+    if (h === EXPECTED_BEARER || h === EXPECTED_TOKEN) return 'ok';
+  }
+  let tokStart: number;
+  if (h.startsWith('Bearer ')) tokStart = 7;
+  else if (h.startsWith('token ')) tokStart = 6;
+  else return 'missing';
+  if (h.length === tokStart) return 'missing';
+  if (TOKEN !== '') return 'wrong';
   return 'ok';
 }
 function authFail(res: ServerResponse, result: AuthResult): void {
@@ -1424,7 +1657,15 @@ function parseJsonBody(buf: Buffer): { ok: true; value: unknown } | { ok: false 
 // ---------------------------------------------------------------- server
 
 function createApp(): Server {
-  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer({ noDelay: true, keepAlive: true }, (req: IncomingMessage, res: ServerResponse) => {
+    try {
+      if (tryHandleSync(req, res)) return;
+    } catch (err: unknown) {
+      try {
+        sendJson(res, 500, { message: err instanceof Error ? err.message : 'Internal Server Error' });
+      } catch { /* socket gone */ }
+      return;
+    }
     handle(req, res).catch((err: unknown) => {
       try {
         sendJson(res, 500, { message: err instanceof Error ? err.message : 'Internal Server Error' });
@@ -1433,63 +1674,172 @@ function createApp(): Server {
   });
   server.keepAliveTimeout = 60000;
   server.headersTimeout = 65000;
+  server.maxRequestsPerSocket = 0;
   return server;
+}
+
+/**
+ * Synchronous hot-path dispatcher for GET/HEAD requests (issues single/list,
+ * git info/refs advertisement, health/meta). Avoids Promise allocation,
+ * microtask turns, regex routing, new URL(), and 'data' listeners.
+ */
+function tryHandleSync(req: IncomingMessage, res: ServerResponse): boolean {
+  const method = req.method ?? 'GET';
+  if (method !== 'GET' && method !== 'HEAD') return false;
+  const isHead = method === 'HEAD';
+  const rawUrl = req.url ?? '/';
+  const qi = rawUrl.indexOf('?');
+  const rawPath = qi >= 0 ? rawUrl.slice(0, qi) : rawUrl;
+  const qs = qi >= 0 ? rawUrl.slice(qi + 1) : '';
+
+  // Static health/meta endpoints
+  if (!isHead) {
+    if (rawPath === '/healthz') { sendJson(res, 200, { ok: true }); return true; }
+    if (PERF_DIAG && rawPath === '/__perf_diag') {
+      sendJson(res, 200, { ...perfDiag, uploadPackCacheBytes: uploadPackCache.bytes, uploadPackCacheEntries: uploadPackCache.size });
+      return true;
+    }
+    if (rawPath === '/api/v3' || rawPath === '/api/v3/') {
+      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
+      return true;
+    }
+    if (rawPath === '/api/v3/meta') { sendJson(res, 200, { installed_version: '1.0.0' }); return true; }
+  }
+
+  // Hot REST v3 issues paths: /api/v3/repos/<owner>/<repo>/issues[/:num]
+  if (rawPath.startsWith('/api/v3/repos/')) {
+    const ownerStart = 14; // '/api/v3/repos/'.length
+    const s1 = rawPath.indexOf('/', ownerStart);
+    if (s1 > ownerStart) {
+      const s2 = rawPath.indexOf('/', s1 + 1);
+      if (s2 > s1 + 1) {
+        const tailStart = s2 + 1;
+        // Exact match: /api/v3/repos/:owner/:repo/issues
+        if (rawPath.length === tailStart + 6 && rawPath.endsWith('/issues')) {
+          const auth = checkAuth(req);
+          if (auth !== 'ok') { authFail(res, auth); return true; }
+          const owner = decodeSeg(rawPath.slice(ownerStart, s1));
+          const repoName = decodeSeg(rawPath.slice(s1 + 1, s2));
+          const repo = getRepo(owner, repoName);
+          if (!repo) { sendJson(res, 404, { message: 'Not Found' }); return true; }
+          const listEtag = `"list-v${repo.issuesVersion}"`;
+          if (etagMatches(req.headers['if-none-match'], listEtag)) {
+            sendNotModified(res, listEtag);
+            return true;
+          }
+          const q = parseIssueListQuery(qs);
+          const host = req.headers.host ?? '127.0.0.1';
+          const entry = getIssueListCached(repo, q, host, rawPath);
+          sendJsonBufFast(res, 200, entry.buf, entry.etag, entry.link, isHead);
+          return true;
+        }
+        // Single issue: /api/v3/repos/:owner/:repo/issues/:num
+        if (rawPath.startsWith('issues/', tailStart)) {
+          const numStart = tailStart + 7;
+          const nextSlash = rawPath.indexOf('/', numStart);
+          if (nextSlash < 0) {
+            const num = parseUintAscii(rawPath, numStart, rawPath.length);
+            if (num >= 0) {
+              const auth = checkAuth(req);
+              if (auth !== 'ok') { authFail(res, auth); return true; }
+              const owner = decodeSeg(rawPath.slice(ownerStart, s1));
+              const repoName = decodeSeg(rawPath.slice(s1 + 1, s2));
+              const repo = getRepo(owner, repoName);
+              if (!repo) { sendJson(res, 404, { message: 'Not Found' }); return true; }
+              const issue = repo.issues.get(num);
+              if (!issue) { sendJson(res, 404, { message: 'Not Found' }); return true; }
+              if (etagMatches(req.headers['if-none-match'], issue.etag)) {
+                sendNotModified(res, issue.etag);
+                return true;
+              }
+              sendJsonBufFast(res, 200, issueJsonBuf(repo, issue), issue.etag, null, isHead);
+              return true;
+            }
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  // Hot Git info/refs advertisement: GET /:owner/:repo.git/info/refs?service=...
+  if (!isHead && rawPath.endsWith('.git/info/refs')) {
+    const s1 = rawPath.indexOf('/', 1);
+    const gitSuffixIdx = rawPath.length - 14; // '.git/info/refs'.length
+    if (s1 > 1 && gitSuffixIdx > s1 + 1 && rawPath.indexOf('/', s1 + 1) === gitSuffixIdx + 4) {
+      const auth = checkAuth(req);
+      if (auth !== 'ok') { authFail(res, auth); return true; }
+      const owner = decodeSeg(rawPath.slice(1, s1));
+      const repoName = decodeSeg(rawPath.slice(s1 + 1, gitSuffixIdx));
+      const repo = getRepo(owner, repoName);
+      if (!repo) { sendJson(res, 404, { message: 'Not Found' }); return true; }
+      let service = '';
+      if (qs === 'service=git-upload-pack') service = 'git-upload-pack';
+      else if (qs === 'service=git-receive-pack') service = 'git-receive-pack';
+      else if (qs.length > 0) {
+        let pos = 0;
+        while (pos < qs.length) {
+          let amp = qs.indexOf('&', pos);
+          if (amp < 0) amp = qs.length;
+          if (qs.startsWith('service=', pos)) {
+            service = decodeQueryVal(qs.slice(pos + 8, amp));
+            break;
+          }
+          pos = amp + 1;
+        }
+      }
+      if (service === 'git-upload-pack') {
+        const v2 = isGitProtoV2(req);
+        sendRaw(res, 200, v2 ? V2_ADVERTISEMENT : v0AdvertisementCached(repo, 'git-upload-pack'), 'application/x-git-upload-pack-advertisement');
+        return true;
+      }
+      if (service === 'git-receive-pack') {
+        sendRaw(res, 200, v0AdvertisementCached(repo, 'git-receive-pack'), 'application/x-git-receive-pack-advertisement');
+        return true;
+      }
+      sendJson(res, 404, { message: 'Not Found' });
+      return true;
+    }
+  }
+
+  return false;
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? 'GET';
 
-  // Fast path: the read workload is 2,000 sequential GETs of one issue on a
-  // keep-alive connection. Answer from the issue's cached serialized form
-  // before any URL parsing, regex routing or JSON work. Anything unusual
-  // (a query string, percent-escapes, a missing repo/issue, no auth) falls
-  // through to the normal path, which owns those answers.
-  if (method === 'GET' && req.url !== undefined && !req.url.includes('?') && !req.url.includes('%')) {
-    const fm = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/.exec(req.url);
-    if (fm) {
-      const auth = checkAuth(req);
-      if (auth !== 'ok') { authFail(res, auth); return; }
-      const repo = getRepo(fm[1], fm[2]);
-      const issue = repo?.issues.get(parseInt(fm[3], 10));
-      if (repo && issue) { sendJsonBuf(res, 200, issueJsonBuf(repo, issue)); return; }
-    }
-  }
-
-  // Fast path: the write workload is 200 sequential POSTs creating issues.
-  // Same guards as the GET fast path (no query, no percent-escapes); the
-  // order mirrors handleRest exactly — auth, then body+JSON (400 beats 404),
-  // then repo lookup (404), then title/label validation (422), then create —
-  // so it skips pathOf/queryOf/route matching in handleRest.
-  if (method === 'POST' && req.url !== undefined && !req.url.includes('?') && !req.url.includes('%')) {
-    const fm = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues$/.exec(req.url);
-    if (fm) {
-      const auth = checkAuth(req);
-      if (auth !== 'ok') { authFail(res, auth); return; }
-      const raw = await readBody(req);
-      const parsed = parseJsonBody(raw);
-      if (!parsed.ok) { sendJson(res, 400, { message: 'Invalid JSON' }); return; }
-      const repo = getRepo(fm[1], fm[2]);
-      if (!repo) { sendJson(res, 404, { message: 'Not Found' }); return; }
-      const b = (parsed.value ?? {}) as J;
-      const title = typeof b.title === 'string' ? b.title : '';
-      if (title === '') { sendJson(res, 422, { message: 'title is required' }); return; }
-      const labelNames: string[] = [];
-      if (Array.isArray(b.labels)) {
-        for (const l of b.labels) {
-          const name = typeof l === 'string' ? l : (l as J)?.name;
-          if (typeof name !== 'string') continue;
-          if (!repo.labels.has(name)) { sendJson(res, 422, { message: `Label '${name}' does not exist` }); return; }
-          labelNames.push(name);
+  // Fast path: 200 sequential POSTs creating issues — no regex, no new URL().
+  if (method === 'POST' && req.url !== undefined && req.url.startsWith('/api/v3/repos/') && req.url.endsWith('/issues')) {
+    const rawUrl = req.url;
+    if (rawUrl.indexOf('?') < 0) {
+      const ownerStart = 14;
+      const s1 = rawUrl.indexOf('/', ownerStart);
+      const s2 = s1 > ownerStart ? rawUrl.indexOf('/', s1 + 1) : -1;
+      if (s2 > s1 + 1 && s2 + 7 === rawUrl.length) {
+        const auth = checkAuth(req);
+        if (auth !== 'ok') { authFail(res, auth); return; }
+        const raw = await readBody(req);
+        const parsed = parseJsonBody(raw);
+        if (!parsed.ok) { sendJson(res, 400, { message: 'Invalid JSON' }); return; }
+        const repo = getRepo(decodeSeg(rawUrl.slice(ownerStart, s1)), decodeSeg(rawUrl.slice(s1 + 1, s2)));
+        if (!repo) { sendJson(res, 404, { message: 'Not Found' }); return; }
+        const b = (parsed.value ?? {}) as J;
+        const title = typeof b.title === 'string' ? b.title : '';
+        if (title === '') { sendJson(res, 422, { message: 'title is required' }); return; }
+        const labelNames: string[] = [];
+        if (Array.isArray(b.labels)) {
+          for (let i = 0; i < b.labels.length; i++) {
+            const l = b.labels[i];
+            const name = typeof l === 'string' ? l : (l as J)?.name;
+            if (typeof name !== 'string') continue;
+            if (!repo.labels.has(name)) { sendJson(res, 422, { message: `Label '${name}' does not exist` }); return; }
+            labelNames.push(name);
+          }
         }
+        const issue = createIssueRecord(repo, title, typeof b.body === 'string' ? b.body : '', labelNames);
+        sendJsonBufFast(res, 201, issueJsonBuf(repo, issue), issue.etag, null, false);
+        return;
       }
-      const number = ++repo.seq;
-      const issue: Issue = {
-        id: objIdSeq++, number, title, body: typeof b.body === 'string' ? b.body : '',
-        state: 'open', labels: labelNames, comments: [], seq: globalSeq++, cached: null,
-      };
-      repo.issues.set(number, issue);
-      sendJsonBuf(res, 201, issueJsonBuf(repo, issue));
-      return;
     }
   }
 
@@ -1585,6 +1935,7 @@ const CAP_MULTI_ACK = 1 << 6;
 const CAP_MULTI_ACK_DETAILED = 1 << 7;
 const CAP_NO_DONE = 1 << 8;
 const CAP_THIN_PACK = 1 << 9;
+const CAP_DEEPEN_RELATIVE = 1 << 10;
 
 function refsFingerprint(repo: Repo): string {
   let fp = '';
@@ -1655,7 +2006,7 @@ function sortedRefs(repo: Repo): Array<{ name: string; oid: string }> {
 }
 function refCaps(service: 'git-upload-pack' | 'git-receive-pack'): string {
   if (service === 'git-upload-pack') {
-    return `symref=HEAD:refs/heads/main object-format=sha1 side-band-64k side-band thin-pack ofs-delta shallow multi_ack agent=${AGENT}`;
+    return `symref=HEAD:refs/heads/main object-format=sha1 side-band-64k side-band thin-pack ofs-delta shallow multi_ack multi_ack_detailed no-done agent=${AGENT}`;
   }
   return `symref=HEAD:refs/heads/main report-status side-band-64k delete-refs ofs-delta agent=${AGENT}`;
 }
@@ -1724,7 +2075,7 @@ function parseLsRefsArgs(packets: Pkt[]): LsRefsArgs {
 function lsRefsResponse(repo: Repo, args: LsRefsArgs): Buffer {
   const lines: string[] = [];
   const mainTip = repo.refs.get('refs/heads/main');
-  if (args.prefixes.length === 0) {
+  if (args.prefixes.length === 0 || args.prefixes.some((p) => 'HEAD'.startsWith(p))) {
     if (mainTip) lines.push(`${mainTip} HEAD${args.symrefs ? ' symref-target:refs/heads/main' : ''}\n`);
     else if (args.unborn) lines.push(`unborn HEAD symref-target:refs/heads/main\n`);
   }
@@ -1773,6 +2124,7 @@ function parseFetchArgs(packets: Pkt[]): FetchArgs {
     else if (line === 'ofs-delta') args.capsMask |= CAP_OFS_DELTA;
     else if (line === 'include-tag') args.capsMask |= CAP_INCLUDE_TAG;
     else if (line === 'thin-pack') args.capsMask |= CAP_THIN_PACK;
+    else if (line === 'deepen-relative') args.capsMask |= CAP_DEEPEN_RELATIVE;
   }
   return args;
 }
@@ -1837,9 +2189,41 @@ function selectFetch(repo: Repo, args: FetchArgs): { objects: PackEntry[]; shall
       direct.add(w);
     }
   }
+  const deepenRelative = (args.capsMask & CAP_DEEPEN_RELATIVE) !== 0;
   let D: Set<string>;
   if (args.depth === null) {
     D = commitClosure(repo, roots);
+  } else if (deepenRelative && args.shallow.length > 0) {
+    D = new Set<string>();
+    const clientShallow = new Set(args.shallow);
+    // Include everything from roots down to the existing shallow boundary.
+    const walkStack = [...roots];
+    while (walkStack.length > 0) {
+      const c = walkStack.pop() as string;
+      if (D.has(c)) continue;
+      const obj = getObj(repo, c);
+      if (!obj || obj.type !== 'commit') continue;
+      D.add(c);
+      if (!clientShallow.has(c)) {
+        for (const p of commitParents(repo, c)) walkStack.push(p);
+      }
+    }
+    // Expand `args.depth` additional generations beyond the client's shallow commits.
+    let frontier: string[] = [];
+    for (const s of args.shallow) {
+      for (const p of commitParents(repo, s)) frontier.push(p);
+    }
+    for (let d = 0; d < args.depth && frontier.length > 0; d++) {
+      const next: string[] = [];
+      for (const c of frontier) {
+        if (D.has(c)) continue;
+        const obj = getObj(repo, c);
+        if (!obj || obj.type !== 'commit') continue;
+        D.add(c);
+        for (const p of commitParents(repo, c)) next.push(p);
+      }
+      frontier = next;
+    }
   } else if (args.depth === 1) {
     // Fast path for shallow depth=1: D is just the root commits, O(|wants|).
     D = new Set<string>();
@@ -1944,26 +2328,31 @@ function v2FetchResponse(repo: Repo, args: FetchArgs): Buffer | Promise<Buffer> 
   return getOrBuildUploadPack(key, canCacheFetch(repo, args), () => {
     const sel = selectFetch(repo, args);
     const parts: Buffer[] = [];
-    parts.push(pktLine('acknowledgments\n'));
-    // An ACK can only name a have the client sent; with no haves the whole
-    // 200-commit closure walk below is pure waste (the clone workload's case).
-    let ack: string | undefined;
-    if (args.haves.length > 0) {
-      const wantClosure = commitClosure(repo, args.wants.filter((w) => {
-        const o = getObj(repo, w);
-        return !!o && o.type === 'commit';
-      }));
-      const sortedHaves = [...args.haves].sort();
-      ack = sortedHaves.find((h) => wantClosure.has(h));
+    const hasDone = (args.capsMask & CAP_DONE) !== 0;
+    // Protocol v2 spec: when the client sends `done`, skip the `acknowledgments`
+    // section and go directly to `shallow-info` (if any) and `packfile`.
+    if (!hasDone) {
+      parts.push(pktLine('acknowledgments\n'));
+      // An ACK can only name a have the client sent; with no haves the whole
+      // closure walk below is pure waste.
+      let ack: string | undefined;
+      if (args.haves.length > 0) {
+        const wantClosure = commitClosure(repo, args.wants.filter((w) => {
+          const o = getObj(repo, w);
+          return !!o && o.type === 'commit';
+        }));
+        const sortedHaves = [...args.haves].sort();
+        ack = sortedHaves.find((h) => wantClosure.has(h));
+      }
+      if (ack) { parts.push(pktLine(`ACK ${ack}\n`)); parts.push(pktLine('ready\n')); }
+      else parts.push(pktLine('NAK\n'));
+      parts.push(DELIM);
     }
-    if (ack) { parts.push(pktLine(`ACK ${ack}\n`)); parts.push(pktLine('ready\n')); }
-    else parts.push(pktLine('NAK\n'));
-    parts.push(FLUSH);
     if (sel.shallow.length > 0 || sel.unshallow.length > 0) {
       parts.push(pktLine('shallow-info\n'));
       for (const s of sel.shallow) parts.push(pktLine(`shallow ${s}\n`));
       for (const s of sel.unshallow) parts.push(pktLine(`unshallow ${s}\n`));
-      parts.push(FLUSH);
+      parts.push(DELIM);
     }
     parts.push(pktLine('packfile\n'));
     parts.push(sidebandPack(writePack(sel.objects), 65515));
@@ -2021,6 +2410,12 @@ function v0FetchResponse(repo: Repo, body: Buffer): Buffer | Promise<Buffer> {
   return getOrBuildUploadPack(key, canCacheFetch(repo, args), () => {
     const sel = selectFetch(repo, args);
     const parts: Buffer[] = [];
+    // Shallow/unshallow lines precede ACK/NAK in v0 when depth negotiation occurred.
+    if (sel.shallow.length > 0 || sel.unshallow.length > 0) {
+      for (const s of sel.shallow) parts.push(pktLine(`shallow ${s}\n`));
+      for (const s of sel.unshallow) parts.push(pktLine(`unshallow ${s}\n`));
+      parts.push(FLUSH);
+    }
     // See v2FetchResponse: no haves means no ACK is possible; skip the closure.
     let ack: string | undefined;
     if (args.haves.length > 0) {
@@ -2031,10 +2426,31 @@ function v0FetchResponse(repo: Repo, body: Buffer): Buffer | Promise<Buffer> {
       const sortedHaves = [...args.haves].sort();
       ack = sortedHaves.find((h) => wantClosure.has(h));
     }
-    if (ack) parts.push(pktLine(`ACK ${ack}\n`));
-    else parts.push(pktLine('NAK\n'));
-    for (const s of sel.shallow) parts.push(pktLine(`shallow ${s}\n`));
-    for (const s of sel.unshallow) parts.push(pktLine(`unshallow ${s}\n`));
+    const isDetailed = (args.capsMask & CAP_MULTI_ACK_DETAILED) !== 0;
+    const hasDone = (args.capsMask & CAP_DONE) !== 0;
+    const hasNoDone = (args.capsMask & CAP_NO_DONE) !== 0;
+    if (isDetailed && ack) {
+      parts.push(pktLine(`ACK ${ack} common\n`));
+      if (!hasDone) {
+        if (hasNoDone) {
+          parts.push(pktLine(`ACK ${ack} ready\n`));
+          parts.push(pktLine('NAK\n'));
+          parts.push(pktLine(`ACK ${ack}\n`));
+        } else {
+          parts.push(pktLine('NAK\n'));
+          return Buffer.concat(parts);
+        }
+      } else {
+        parts.push(pktLine(`ACK ${ack}\n`));
+      }
+    } else if (ack) {
+      parts.push(pktLine(`ACK ${ack}\n`));
+    } else {
+      parts.push(pktLine('NAK\n'));
+      if (isDetailed && !hasDone && args.haves.length > 0) {
+        return Buffer.concat(parts);
+      }
+    }
     const pack = writePack(sel.objects);
     if (args.capsMask & CAP_SIDE_BAND_64K) {
       parts.push(sidebandPack(pack, 65515));
@@ -2125,22 +2541,25 @@ async function receivePackResponse(repo: Repo, body: Buffer): Promise<Buffer> {
 }
 
 async function handleGit(req: IncomingMessage, res: ServerResponse, path: string): Promise<boolean> {
-  const m = /^\/(.+?)\/(.+?)\.git\/(.*)$/.exec(path);
-  if (!m) return false;
-  const owner = decodeURIComponent(m[1]);
-  const repoName = decodeURIComponent(m[2]);
-  const tail = m[3];
+  // Fast non-regex extraction of /:owner/:repo.git/:tail
+  const gitIdx = path.indexOf('.git/');
+  if (gitIdx < 3 || path.charCodeAt(0) !== 47 /* '/' */) return false;
+  const slash = path.indexOf('/', 1);
+  if (slash <= 1 || slash >= gitIdx - 1) return false;
+  const owner = decodeSeg(path.slice(1, slash));
+  const repoName = decodeSeg(path.slice(slash + 1, gitIdx));
+  const tail = path.slice(gitIdx + 5);
   const method = req.method ?? 'GET';
-  const q = queryOf(req);
   const auth = checkAuth(req);
   if (auth !== 'ok') { authFail(res, auth); return true; }
   const repo = getRepo(owner, repoName);
   if (!repo) { sendJson(res, 404, { message: 'Not Found' }); return true; }
 
   if (method === 'GET' && tail === 'info/refs') {
+    const q = queryOf(req);
     const service = q.get('service') ?? '';
     if (service === 'git-upload-pack') {
-      const v2 = (req.headers['git-protocol'] ?? '') === 'version=2';
+      const v2 = isGitProtoV2(req);
       sendRaw(res, 200, v2 ? V2_ADVERTISEMENT : v0AdvertisementCached(repo, 'git-upload-pack'), 'application/x-git-upload-pack-advertisement');
       return true;
     }
@@ -2153,7 +2572,7 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
   }
   if (method === 'POST' && tail === 'git-upload-pack') {
     const body = await readBody(req);
-    const v2 = (req.headers['git-protocol'] ?? '') === 'version=2';
+    const v2 = isGitProtoV2(req);
     let packets: Pkt[];
     try {
       packets = parsePktLines(body);
@@ -2210,8 +2629,7 @@ function viewerShape(): J {
 // allocating a fresh object literal per issue/comment/pull shape.
 const VIEWER_SHAPE: J = viewerShape();
 function openCount(repo: Repo): number {
-  let n = 0;
-  for (const i of repo.issues.values()) if (i.state === 'open') n++;
+  let n = repo.openIssues.length;
   for (const p of repo.pulls.values()) if (p.state === 'open') n++;
   return n;
 }
@@ -2247,16 +2665,119 @@ function issueShape(repo: Repo, issue: Issue): J {
     url: `/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
   };
 }
+
+const VIEWER_JSON = JSON.stringify(VIEWER_SHAPE);
+const ISSUE_MID_OPEN = `],"user":${VIEWER_JSON},"assignee":null,"assignees":[],"milestone":null,"locked":false,"comments":`;
+const ISSUE_DATES_OPEN = `,"created_at":"${FIXED_ISO}","updated_at":"${FIXED_ISO}","closed_at":null,"html_url":"https://github.com/`;
+const ISSUE_DATES_CLOSED = `,"created_at":"${FIXED_ISO}","updated_at":"${FIXED_ISO}","closed_at":"${FIXED_ISO}","html_url":"https://github.com/`;
+const B_OPEN = Buffer.from('[', 'ascii');
+const B_COMMA = Buffer.from(',', 'ascii');
+const B_CLOSE_NL = Buffer.from(']\n', 'ascii');
+const B_EMPTY_ARR_NL = Buffer.from('[]\n', 'ascii');
+
 /** The exact bytes sendJson would write for this issue, memoized. */
 function issueJsonBuf(repo: Repo, issue: Issue): Buffer {
-  if (issue.cached) return issue.cached;
-  const buf = Buffer.from(`${JSON.stringify(issueShape(repo, issue))}\n`, 'utf8');
-  issue.cached = buf;
+  if (issue.jsonBuf !== null) return issue.jsonBuf;
+  let text: string;
+  if (issue.labels.length === 0) {
+    const slug = `${repo.owner}/${repo.name}/issues/${issue.number}`;
+    const dates = issue.state === 'closed' ? ISSUE_DATES_CLOSED : ISSUE_DATES_OPEN;
+    text = `{"id":${issue.id},"number":${issue.number},"title":${JSON.stringify(issue.title)},"body":${JSON.stringify(issue.body)},"state":"${issue.state}","labels":[${ISSUE_MID_OPEN}${issue.comments.length}${dates}${slug}","url":"/api/v3/repos/${slug}"}\n`;
+  } else {
+    text = `${JSON.stringify(issueShape(repo, issue))}\n`;
+  }
+  const buf = Buffer.from(text, 'utf8');
+  issue.jsonBuf = buf;
   return buf;
 }
-/** Drop the memoized form after any mutation of the issue. */
-function invalidateIssue(issue: Issue): void {
-  issue.cached = null;
+
+function buildIssueListLink(host: string, reqPath: string, q: IssueListQuery, total: number): string | null {
+  const start = (q.page - 1) * q.perPage;
+  const hasNext = start + q.perPage < total;
+  const hasPrev = q.page > 1;
+  if (!hasNext && !hasPrev) return null;
+  const base = `http://${host}${reqPath}`;
+  const qp = new URLSearchParams(q.rawQs);
+  const links: string[] = [];
+  if (hasNext) {
+    qp.set('page', String(q.page + 1));
+    qp.set('per_page', String(q.perPage));
+    links.push(`<${base}?${qp.toString()}>; rel="next"`);
+  }
+  if (hasPrev) {
+    qp.set('page', String(q.page - 1));
+    links.push(`<${base}?${qp.toString()}>; rel="prev"`);
+  }
+  return links.join(', ');
+}
+
+/**
+ * O(pageSize) issue list builder + per-repo split-version cache.
+ * Slices directly from openIssues/closedIssues/allIssues and assembles JSON
+ * array via Buffer.concat([B_OPEN, buf0, B_COMMA, ..., B_CLOSE_NL]) without
+ * calling JSON.stringify(array).
+ */
+function getIssueListCached(repo: Repo, q: IssueListQuery, host: string, reqPath: string): IssueListCacheEntry {
+  const cacheKey = `${q.state}|${q.direction}|${q.labels}|${q.page}|${q.perPage}|${host}|${reqPath}`;
+  const hit = repo.issueListCache.get(cacheKey);
+  if (hit !== undefined) return hit;
+
+  let src: Issue[];
+  if (q.state === 'open') src = repo.openIssues;
+  else if (q.state === 'closed') src = repo.closedIssues;
+  else if (q.state === 'all') src = repo.allIssues;
+  else src = [];
+
+  if (q.labels !== '') {
+    const wanted = q.labels.split(',').filter((s) => s.length > 0);
+    if (wanted.length > 0) {
+      const filtered: Issue[] = [];
+      for (let i = 0; i < src.length; i++) {
+        const iss = src[i];
+        let ok = true;
+        for (let j = 0; j < wanted.length; j++) {
+          if (!iss.labels.includes(wanted[j])) { ok = false; break; }
+        }
+        if (ok) filtered.push(iss);
+      }
+      src = filtered;
+    }
+  }
+
+  const total = src.length;
+  const start = (q.page - 1) * q.perPage;
+  const count = start >= total ? 0 : Math.min(q.perPage, total - start);
+  let buf: Buffer;
+  if (count === 0) {
+    buf = B_EMPTY_ARR_NL;
+  } else {
+    const asc = q.direction === 'asc';
+    const parts: Buffer[] = new Array(count * 2 + 1);
+    parts[0] = B_OPEN;
+    let totalBytes = 3; // '[' + ']\n'
+    let pIdx = 1;
+    for (let i = 0; i < count; i++) {
+      const iss = asc ? src[start + i] : src[total - 1 - (start + i)];
+      const full = issueJsonBuf(repo, iss);
+      // Zero-copy slice stripping trailing '\n'
+      const itemSlice = full.subarray(0, full.length - 1);
+      if (i > 0) {
+        parts[pIdx++] = B_COMMA;
+        totalBytes += 1;
+      }
+      parts[pIdx++] = itemSlice;
+      totalBytes += itemSlice.length;
+    }
+    parts[pIdx] = B_CLOSE_NL;
+    buf = Buffer.concat(parts, totalBytes);
+  }
+
+  const link = buildIssueListLink(host, reqPath, q, total);
+  const etag = `"list-v${repo.issuesVersion}"`;
+  const entry: IssueListCacheEntry = { buf, link, etag };
+  if (repo.issueListCache.size >= 64) repo.issueListCache.clear();
+  repo.issueListCache.set(cacheKey, entry);
+  return entry;
 }
 function commentShape(repo: Repo, c: Comment): J {
   return {
@@ -2395,6 +2916,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
       repos.delete(repoKey(repo.owner, repo.name));
       repo.name = b.name;
       repos.set(repoKey(repo.owner, repo.name), repo);
+      for (const iss of repo.allIssues) invalidateIssue(repo, iss);
     }
     if (typeof b.default_branch === 'string' && repo.refs.has(`refs/heads/${b.default_branch}`)) repo.defaultBranch = b.default_branch;
     sendJson(res, 200, repoShape(repo));
@@ -2573,15 +3095,17 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
   }
   // issues
   if (tail === 'issues') {
-    if (method === 'GET') {
-      const state = q.get('state') ?? 'open';
-      const sort = q.get('sort') ?? 'created';
-      const direction = q.get('direction') ?? 'desc';
-      let list = [...repo.issues.values()];
-      if (state !== 'all') list = list.filter((i) => i.state === state);
-      list.sort((a, b2) => (direction === 'asc' ? a.seq - b2.seq : b2.seq - a.seq));
-      void sort;
-      sendPage(res, list.map((i) => issueShape(repo, i)), q, req);
+    if (method === 'GET' || method === 'HEAD') {
+      const listEtag = `"list-v${repo.issuesVersion}"`;
+      if (etagMatches(req.headers['if-none-match'], listEtag)) {
+        sendNotModified(res, listEtag);
+        return true;
+      }
+      const rawUrl = req.url ?? '';
+      const qi = rawUrl.indexOf('?');
+      const iq = parseIssueListQuery(qi >= 0 ? rawUrl.slice(qi + 1) : '');
+      const entry = getIssueListCached(repo, iq, req.headers.host ?? '127.0.0.1', path);
+      sendJsonBufFast(res, 200, entry.buf, entry.etag, entry.link, method === 'HEAD');
       return true;
     }
     if (method === 'POST') {
@@ -2596,13 +3120,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
           labelNames.push(name);
         }
       }
-      const number = ++repo.seq;
-      const issue: Issue = {
-        id: objIdSeq++, number, title, body: typeof b.body === 'string' ? b.body : '',
-        state: 'open', labels: labelNames, comments: [], seq: globalSeq++, cached: null,
-      };
-      repo.issues.set(number, issue);
-      sendJsonBuf(res, 201, issueJsonBuf(repo, issue));
+      const issue = createIssueRecord(repo, title, typeof b.body === 'string' ? b.body : '', labelNames);
+      sendJsonBufFast(res, 201, issueJsonBuf(repo, issue), issue.etag, null, false);
       return true;
     }
   }
@@ -2623,15 +3142,23 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
           if (cbody === '') { sendJson(res, 422, { message: 'body is required' }); return true; }
           const comment: Comment = { id: objIdSeq++, body: cbody };
           issue.comments.push(comment);
-          invalidateIssue(issue);
+          invalidateIssue(repo, issue);
           sendJson(res, 201, commentShape(repo, comment));
           return true;
         }
       }
       if (sub === '') {
         if (!issue) { sendJson(res, 404, { message: 'Not Found' }); return true; }
-        if (method === 'GET') { sendJsonBuf(res, 200, issueJsonBuf(repo, issue)); return true; }
+        if (method === 'GET' || method === 'HEAD') {
+          if (etagMatches(req.headers['if-none-match'], issue.etag)) {
+            sendNotModified(res, issue.etag);
+            return true;
+          }
+          sendJsonBufFast(res, 200, issueJsonBuf(repo, issue), issue.etag, null, method === 'HEAD');
+          return true;
+        }
         if (method === 'PATCH') {
+          const prevState = issue.state;
           if (typeof b.title === 'string') issue.title = b.title;
           if (typeof b.body === 'string') issue.body = b.body;
           if (b.state === 'open' || b.state === 'closed') issue.state = b.state;
@@ -2643,8 +3170,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
             }
             issue.labels = names;
           }
-          invalidateIssue(issue);
-          sendJson(res, 200, issueShape(repo, issue));
+          invalidateIssue(repo, issue, prevState);
+          sendJsonBufFast(res, 200, issueJsonBuf(repo, issue), issue.etag, null, false);
           return true;
         }
       }
@@ -3210,9 +3737,7 @@ function registerGqlResolvers(): void {
     const repo = dec?.kind === 'Repository' ? reposById.get(Number(dec.parts[0])) : undefined;
     if (!repo) { ctx.errors.push({ message: 'Repository not found' }); return { __typename: 'CreateIssuePayload', issue: null }; }
     const title = String(input.title ?? '');
-    const number = ++repo.seq;
-    const issue: Issue = { id: objIdSeq++, number, title, body: typeof input.body === 'string' ? input.body : '', state: 'open', labels: [], comments: [], seq: globalSeq++, cached: null };
-    repo.issues.set(number, issue);
+    const issue = createIssueRecord(repo, title, typeof input.body === 'string' ? input.body : '', []);
     return { __typename: 'CreateIssuePayload', issue: issueGql(repo, issue) };
   });
   defResolver('Mutation', 'closeIssue', (_p, args, ctx) => {
@@ -3221,8 +3746,9 @@ function registerGqlResolvers(): void {
     const repo = dec?.kind === 'Issue' ? reposById.get(Number(dec.parts[0])) : undefined;
     const issue = repo?.issues.get(Number(dec?.parts[1] ?? -1));
     if (!repo || !issue) { ctx.errors.push({ message: 'Issue not found' }); return { __typename: 'CloseIssuePayload', issue: null }; }
+    const prevState = issue.state;
     issue.state = 'closed';
-    invalidateIssue(issue);
+    invalidateIssue(repo, issue, prevState);
     return { __typename: 'CloseIssuePayload', issue: issueGql(repo, issue) };
   });
   defResolver('Mutation', 'createPullRequest', (_p, args, ctx) => {
@@ -3270,7 +3796,7 @@ function registerGqlResolvers(): void {
     if (!repo || !issue) { ctx.errors.push({ message: 'Issue not found' }); return { __typename: 'AddCommentPayload', commentEdge: null }; }
     const comment: Comment = { id: objIdSeq++, body: String(input.body ?? '') };
     issue.comments.push(comment);
-    invalidateIssue(issue);
+    invalidateIssue(repo, issue);
     return { __typename: 'AddCommentPayload', commentEdge: { __typename: 'IssueCommentEdge', __node: commentGql(repo, issue, comment) } };
   });
   // payload pass-through fields
@@ -3527,13 +4053,8 @@ function mcpCallTool(name: string, args: Record<string, unknown>): { content: Ar
         labelNames.push(n);
       }
     }
-    const number = ++repo.seq;
-    const issue: Issue = {
-      id: objIdSeq++, number, title,
-      body: typeof mcpPick(args, ['body', 'description', 'content']) === 'string' ? String(mcpPick(args, ['body', 'description', 'content'])) : '',
-      state: 'open', labels: labelNames, comments: [], seq: globalSeq++, cached: null,
-    };
-    repo.issues.set(number, issue);
+    const bodyText = typeof mcpPick(args, ['body', 'description', 'content']) === 'string' ? String(mcpPick(args, ['body', 'description', 'content'])) : '';
+    const issue = createIssueRecord(repo, title, bodyText, labelNames);
     return mcpToolResult(issueShape(repo, issue));
   }
   if (name === 'list_issues') {
@@ -3543,10 +4064,9 @@ function mcpCallTool(name: string, args: Record<string, unknown>): { content: Ar
     const repo = getRepo(owner, repoName);
     if (!repo) return mcpToolError('Not Found');
     const state = String(mcpPick(args, ['state']) ?? 'open');
-    let list = [...repo.issues.values()];
-    if (state !== 'all') list = list.filter((i) => i.state === state);
-    list.sort((a, b) => b.seq - a.seq);
-    const issues = list.map((i) => issueShape(repo, i));
+    const src = state === 'open' ? repo.openIssues : state === 'closed' ? repo.closedIssues : state === 'all' ? repo.allIssues : [];
+    const issues: J[] = new Array(src.length);
+    for (let i = 0; i < src.length; i++) issues[i] = issueShape(repo, src[src.length - 1 - i]);
     return mcpToolResult({ issues });
   }
   if (name === 'create_pull_request') {
