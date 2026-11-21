@@ -27,6 +27,15 @@ const IDENT = `${VIEWER.name} <${VIEWER.email}>`;
 const ZERO_OID = '0'.repeat(40);
 const HEX40 = /^[0-9a-f]{40}$/;
 const AGENT = 'forge/1.0';
+const PERF_DIAG = process.env.PERF_DIAG === '1';
+const perfDiag = {
+  uploadPackHits: 0,
+  uploadPackMisses: 0,
+  uploadPackSingleflight: 0,
+  packedEntryReused: 0,
+  packedEntryDeflated: 0,
+  inflaterMode: 'uninitialized',
+};
 
 // ---------------------------------------------------------------- small utils
 
@@ -49,7 +58,41 @@ function esc(s: string): string {
 // ---------------------------------------------------------------- git objects
 
 type ObjType = 'commit' | 'tree' | 'blob' | 'tag';
-interface GitObj { type: ObjType; data: Buffer; }
+interface GitObj { type: ObjType; data: Buffer; packedEntry: Buffer | null; }
+const PACK_OBJ_TYPE_CODE: Record<ObjType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
+
+function encodePackObjHeader(typeCode: number, size: number): Buffer {
+  const tmp = Buffer.allocUnsafe(10);
+  let len = 0;
+  let s = size;
+  let first = (typeCode << 4) | (s & 0x0f);
+  s >>>= 4;
+  if (s > 0) first |= 0x80;
+  tmp[len++] = first;
+  while (s > 0) {
+    let b = s & 0x7f;
+    s >>>= 7;
+    if (s > 0) b |= 0x80;
+    tmp[len++] = b;
+  }
+  return tmp.subarray(0, len);
+}
+
+/** Return [varint(type, rawSize) + zlib bytes] for an object, deflating lazily once at level 1. */
+function getPackedEntry(obj: GitObj): Buffer {
+  if (obj.packedEntry !== null) {
+    if (PERF_DIAG) perfDiag.packedEntryReused++;
+    return obj.packedEntry;
+  }
+  if (PERF_DIAG) perfDiag.packedEntryDeflated++;
+  const hdr = encodePackObjHeader(PACK_OBJ_TYPE_CODE[obj.type], obj.data.length);
+  const comp = deflateSync(obj.data, { level: 1 });
+  const entry = Buffer.allocUnsafe(hdr.length + comp.length);
+  hdr.copy(entry, 0);
+  comp.copy(entry, hdr.length);
+  obj.packedEntry = entry;
+  return entry;
+}
 
 function hashObject(type: ObjType, data: Buffer): string {
   const h = createHash('sha1');
@@ -206,7 +249,7 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
   return out;
 }
 
-interface PackEntry { oid: string; type: ObjType; data: Buffer; }
+interface PackEntry { oid: string; type: ObjType; data: Buffer; packedEntry?: Buffer | null; obj?: GitObj; }
 /**
  * Inflate one pack entry's zlib stream, reporting how many compressed bytes it
  * consumed. v2 used one streaming Inflate per object (~200 us: stream setup
@@ -265,7 +308,7 @@ async function readPack(buf: Buffer): Promise<PackEntry[]> {
   if (trailerStart < 12) throw new Error('pack too short');
   const expect = sha1(buf.subarray(0, trailerStart));
   if (buf.subarray(trailerStart).toString('hex') !== expect) throw new Error('pack checksum mismatch');
-  interface Raw { offset: number; typeCode: number; type: ObjType | null; data: Buffer; baseOffset: number | null; baseOid: string | null; }
+  interface Raw { offset: number; typeCode: number; type: ObjType | null; data: Buffer; baseOffset: number | null; baseOid: string | null; packedEntry: Buffer | null; }
   const raws: Raw[] = [];
   let off = 12;
   for (let i = 0; i < count; i++) {
@@ -301,8 +344,12 @@ async function readPack(buf: Buffer): Promise<PackEntry[]> {
     // compressed bytes it consumed, so one inflate per object suffices.
     const { data, consumed } = await inflateEntry(buf, off, size);
     off += consumed;
-    const typeMap: Record<number, ObjType | null> = PACK_TYPE_MAP;
-    raws.push({ offset: start, typeCode, type: typeMap[typeCode] ?? null, data, baseOffset, baseOid });
+    const objType = PACK_TYPE_MAP[typeCode] ?? null;
+    // Non-delta objects: copy exact [varint(type, rawSize) + zlib bytes] slice
+    // so upload-pack can emit it directly with zero deflateSync calls, without
+    // retaining a reference to the entire incoming HTTP body buffer.
+    const packedEntry = objType !== null ? Buffer.from(buf.subarray(start, off)) : null;
+    raws.push({ offset: start, typeCode, type: objType, data, baseOffset, baseOid, packedEntry });
   }
   const byOffset = new Map<number, PackEntry>();
   const byOid = new Map<string, PackEntry>();
@@ -313,13 +360,13 @@ async function readPack(buf: Buffer): Promise<PackEntry[]> {
     seen.add(raw.offset);
     let entry: PackEntry;
     if (raw.type !== null) {
-      entry = { oid: hashObject(raw.type, raw.data), type: raw.type, data: raw.data };
+      entry = { oid: hashObject(raw.type, raw.data), type: raw.type, data: raw.data, packedEntry: raw.packedEntry };
     } else if (raw.baseOffset !== null) {
       const baseRaw = raws.find((r) => r.offset === raw.baseOffset);
       if (!baseRaw) throw new Error('ofs-delta base missing');
       const base = resolve(baseRaw, seen);
       const data = applyDelta(base.data, raw.data);
-      entry = { oid: hashObject(base.type, data), type: base.type, data };
+      entry = { oid: hashObject(base.type, data), type: base.type, data, packedEntry: null };
     } else {
       const base = byOid.get(raw.baseOid ?? '');
       if (!base) {
@@ -327,10 +374,10 @@ async function readPack(buf: Buffer): Promise<PackEntry[]> {
         if (!baseRaw) throw new Error('ref-delta base missing');
         const b = resolve(baseRaw, seen);
         const data = applyDelta(b.data, raw.data);
-        entry = { oid: hashObject(b.type, data), type: b.type, data };
+        entry = { oid: hashObject(b.type, data), type: b.type, data, packedEntry: null };
       } else {
         const data = applyDelta(base.data, raw.data);
-        entry = { oid: hashObject(base.type, data), type: base.type, data };
+        entry = { oid: hashObject(base.type, data), type: base.type, data, packedEntry: null };
       }
     }
     byOffset.set(raw.offset, entry);
@@ -343,32 +390,40 @@ async function readPack(buf: Buffer): Promise<PackEntry[]> {
 }
 
 function writePack(entries: PackEntry[]): Buffer {
-  const parts: Buffer[] = [];
-  const head = Buffer.alloc(12);
-  head.write('PACK', 0, 4, 'ascii');
-  head.writeUInt32BE(2, 4);
-  head.writeUInt32BE(entries.length, 8);
-  parts.push(head);
-  const code: Record<ObjType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
-  for (const e of entries) {
-    const size = e.data.length;
-    const headerBytes: number[] = [];
-    let s = size;
-    let first = (code[e.type] << 4) | (s & 0x0f);
-    s >>= 4;
-    if (s > 0) first |= 0x80;
-    headerBytes.push(first);
-    while (s > 0) {
-      let b = s & 0x7f;
-      s >>= 7;
-      if (s > 0) b |= 0x80;
-      headerBytes.push(b);
+  // No delta compression for shallow clones or small packs: emit pre-compressed
+  // packedEntry slices directly into a single pre-allocated buffer + SHA-1 trailer.
+  const packed: Buffer[] = new Array(entries.length);
+  let bodyLen = 12;
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    let pe: Buffer;
+    if (e.obj) {
+      pe = getPackedEntry(e.obj);
+    } else if (e.packedEntry) {
+      pe = e.packedEntry;
+    } else {
+      const hdr = encodePackObjHeader(PACK_OBJ_TYPE_CODE[e.type], e.data.length);
+      const comp = deflateSync(e.data, { level: 1 });
+      pe = Buffer.allocUnsafe(hdr.length + comp.length);
+      hdr.copy(pe, 0);
+      comp.copy(pe, hdr.length);
+      e.packedEntry = pe;
     }
-    parts.push(Buffer.from(headerBytes));
-    parts.push(deflateSync(e.data, { level: 1 }));
+    packed[i] = pe;
+    bodyLen += pe.length;
   }
-  const body = Buffer.concat(parts);
-  return Buffer.concat([body, createHash('sha1').update(body).digest()]);
+  const out = Buffer.allocUnsafe(bodyLen + 20);
+  out.write('PACK', 0, 4, 'ascii');
+  out.writeUInt32BE(2, 4);
+  out.writeUInt32BE(entries.length, 8);
+  let pos = 12;
+  for (let i = 0; i < packed.length; i++) {
+    const pe = packed[i];
+    pe.copy(out, pos);
+    pos += pe.length;
+  }
+  createHash('sha1').update(out.subarray(0, bodyLen)).digest().copy(out, bodyLen);
+  return out;
 }
 
 // ---------------------------------------------------------------- store
@@ -435,7 +490,7 @@ function createRepoRecord(name: string, isPrivate: boolean, description: string)
 // object helpers bound to a repo
 function putObj(repo: Repo, type: ObjType, data: Buffer): string {
   const oid = hashObject(type, data);
-  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data, packedEntry: null });
   return oid;
 }
 function getObj(repo: Repo, oid: string): GitObj | undefined {
@@ -499,7 +554,7 @@ function commitTree(repo: Repo, baseTreeOid: string | null, changes: Map<string,
   const rootBytes = buildTree(rootEntries);
   root = putObj(repo, 'tree', rootBytes);
   // store all intermediate trees too
-  for (const [oid, bytes] of trees) if (!repo.objects.has(oid)) repo.objects.set(oid, { type: 'tree', data: bytes });
+  for (const [oid, bytes] of trees) if (!repo.objects.has(oid)) repo.objects.set(oid, { type: 'tree', data: bytes, packedEntry: null });
   return root;
 }
 function subtreeOid(repo: Repo, files: Map<string, { mode: string; oid: string }>, prefix: string): string {
@@ -859,6 +914,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     sendJson(res, 200, { ok: true });
     return;
   }
+  if (PERF_DIAG && method === 'GET' && path === '/__perf_diag') {
+    sendJson(res, 200, { ...perfDiag, uploadPackCacheBytes: uploadPackCache.bytes, uploadPackCacheEntries: uploadPackCache.size });
+    return;
+  }
   if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
     sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
     return;
@@ -880,28 +939,130 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 
 // ---- hot-path caches ----
 // Git objects are immutable by OID, so a fetch response depends only on its
-// (wants, haves, depth, shallow) arguments plus the objects it names: it is
-// safe to memoize per repository. Advertisements and ls-refs depend on the ref
-// set, so they are keyed on a fingerprint of it. The clone workload issues 50
-// concurrent identical depth-1 fetches and the push workload re-reads the
-// receive-pack advertisement on every push, so these caches are the whole
-// clone/push win after the pack parser. Sizes are capped; a clear only ever
-// costs a rebuild, never correctness.
-const fetchCache = new Map<string, Buffer>();
+// normalized protocol/wants/haves/depth/shallow/filter/caps arguments plus the
+// objects it names: safe to memoize per repository in a byte-bounded LRU.
+// Advertisements and ls-refs depend on the ref set, so they are keyed on a
+// fingerprint of it. Singleflight coalesces concurrent identical fetch builds.
+class ByteLruCache {
+  private map = new Map<string, Buffer>();
+  private maxBytes: number;
+  bytes = 0;
+  constructor(maxBytes: number) {
+    this.maxBytes = maxBytes;
+  }
+  get size(): number {
+    return this.map.size;
+  }
+  get(key: string): Buffer | undefined {
+    const v = this.map.get(key);
+    if (v === undefined) return undefined;
+    // Promote to MRU in O(1) using Map insertion order.
+    this.map.delete(key);
+    this.map.set(key, v);
+    return v;
+  }
+  set(key: string, val: Buffer): Buffer {
+    if (val.length > this.maxBytes) return val;
+    const old = this.map.get(key);
+    if (old !== undefined) {
+      this.bytes -= old.length;
+      this.map.delete(key);
+    }
+    while (this.bytes + val.length > this.maxBytes && this.map.size > 0) {
+      const oldestKey = this.map.keys().next().value as string;
+      const oldestVal = this.map.get(oldestKey) as Buffer;
+      this.map.delete(oldestKey);
+      this.bytes -= oldestVal.length;
+    }
+    this.map.set(key, val);
+    this.bytes += val.length;
+    return val;
+  }
+  clear(): void {
+    this.map.clear();
+    this.bytes = 0;
+  }
+}
+
+const uploadPackCache = new ByteLruCache(64 * 1024 * 1024);
+const uploadPackInflight = new Map<string, Promise<Buffer>>();
 const lsRefsCache = new Map<string, Buffer>();
 const advertCache = new Map<string, Buffer>();
+
+// Capability bitmask for deterministic upload-pack cache keys.
+const CAP_SIDE_BAND_64K = 1 << 0;
+const CAP_SIDE_BAND = 1 << 1;
+const CAP_NO_PROGRESS = 1 << 2;
+const CAP_OFS_DELTA = 1 << 3;
+const CAP_INCLUDE_TAG = 1 << 4;
+const CAP_DONE = 1 << 5;
+const CAP_MULTI_ACK = 1 << 6;
+const CAP_MULTI_ACK_DETAILED = 1 << 7;
+const CAP_NO_DONE = 1 << 8;
+const CAP_THIN_PACK = 1 << 9;
+
 function refsFingerprint(repo: Repo): string {
   let fp = '';
   for (const [name, oid] of repo.refs) fp += `${name}=${oid};`;
   return fp;
 }
-function fetchCacheKey(repo: Repo, args: FetchArgs): string {
-  return `${repo.id}|${args.wants.join(',')}|${args.haves.join(',')}|${args.depth ?? ''}|${args.shallow.join(',')}|${args.deepenSince ?? ''}|${args.deepenNot.join(',')}`;
+function sortedUniqueJoin(arr: string[]): string {
+  if (arr.length === 0) return '';
+  if (arr.length === 1) return arr[0];
+  const copy = [...arr].sort();
+  let out = copy[0];
+  for (let i = 1; i < copy.length; i++) {
+    if (copy[i] !== copy[i - 1]) out += `,${copy[i]}`;
+  }
+  return out;
+}
+function fetchCacheKey(proto: 'v0' | 'v2', repo: Repo, args: FetchArgs): string {
+  return `${proto}|${repo.id}|${sortedUniqueJoin(args.wants)}|${sortedUniqueJoin(args.haves)}|${args.depth ?? ''}|${sortedUniqueJoin(args.shallow)}|${args.deepenSince ?? ''}|${sortedUniqueJoin(args.deepenNot)}|${args.filter}|${args.capsMask}`;
+}
+function canCacheFetch(repo: Repo, args: FetchArgs): boolean {
+  if (args.deepenNot.length > 0) return false;
+  for (let i = 0; i < args.wants.length; i++) {
+    if (!repo.objects.has(args.wants[i])) return false;
+  }
+  return true;
 }
 function cachePut(m: Map<string, Buffer>, key: string, buf: Buffer): Buffer {
   if (m.size > 128) m.clear();
   m.set(key, buf);
   return buf;
+}
+function getOrBuildUploadPack(key: string, cacheable: boolean, build: () => Buffer): Buffer | Promise<Buffer> {
+  if (cacheable) {
+    const hit = uploadPackCache.get(key);
+    if (hit !== undefined) {
+      if (PERF_DIAG) perfDiag.uploadPackHits++;
+      return hit;
+    }
+    const inflight = uploadPackInflight.get(key);
+    if (inflight !== undefined) {
+      if (PERF_DIAG) { perfDiag.uploadPackHits++; perfDiag.uploadPackSingleflight++; }
+      return inflight;
+    }
+  }
+  if (PERF_DIAG) perfDiag.uploadPackMisses++;
+  if (!cacheable) return build();
+  let resolveFn!: (b: Buffer) => void;
+  let rejectFn!: (e: unknown) => void;
+  const p = new Promise<Buffer>((res, rej) => { resolveFn = res; rejectFn = rej; });
+  uploadPackInflight.set(key, p);
+  try {
+    const buf = build();
+    uploadPackCache.set(key, buf);
+    uploadPackInflight.delete(key);
+    resolveFn(buf);
+    return buf;
+  } catch (err) {
+    uploadPackInflight.delete(key);
+    rejectFn(err);
+    // Avoid unhandled rejection if no follower attached
+    p.catch(() => {});
+    throw err;
+  }
 }
 
 function sortedRefs(repo: Repo): Array<{ name: string; oid: string }> {
@@ -994,9 +1155,21 @@ function lsRefsResponse(repo: Repo, args: LsRefsArgs): Buffer {
   return pktLines([...lines, 'flush']);
 }
 
-interface FetchArgs { wants: string[]; haves: string[]; shallow: string[]; depth: number | null; deepenSince: number | null; deepenNot: string[]; }
+interface FetchArgs {
+  wants: string[];
+  haves: string[];
+  shallow: string[];
+  depth: number | null;
+  deepenSince: number | null;
+  deepenNot: string[];
+  filter: string;
+  capsMask: number;
+}
 function parseFetchArgs(packets: Pkt[]): FetchArgs {
-  const args: FetchArgs = { wants: [], haves: [], shallow: [], depth: null, deepenSince: null, deepenNot: [] };
+  const args: FetchArgs = {
+    wants: [], haves: [], shallow: [], depth: null, deepenSince: null, deepenNot: [],
+    filter: '', capsMask: CAP_SIDE_BAND_64K,
+  };
   let seenDelim = false;
   for (const p of packets) {
     if (p.kind === 'delim') { seenDelim = true; continue; }
@@ -1009,6 +1182,12 @@ function parseFetchArgs(packets: Pkt[]): FetchArgs {
     else if (line.startsWith('deepen ')) args.depth = parseInt(line.slice(7), 10);
     else if (line.startsWith('deepen-since ')) args.deepenSince = parseInt(line.slice(13), 10);
     else if (line.startsWith('deepen-not ')) args.deepenNot.push(line.slice(11));
+    else if (line.startsWith('filter ')) args.filter = line.slice(7);
+    else if (line === 'done') args.capsMask |= CAP_DONE;
+    else if (line === 'no-progress') args.capsMask |= CAP_NO_PROGRESS;
+    else if (line === 'ofs-delta') args.capsMask |= CAP_OFS_DELTA;
+    else if (line === 'include-tag') args.capsMask |= CAP_INCLUDE_TAG;
+    else if (line === 'thin-pack') args.capsMask |= CAP_THIN_PACK;
   }
   return args;
 }
@@ -1036,30 +1215,53 @@ function closureWithShallow(repo: Repo, tips: string[], shallow: Set<string>): S
   }
   return out;
 }
-function treeClosure(repo: Repo, treeOid: string, out: Set<string>): void {
+function treeClosure(repo: Repo, treeOid: string, out: Set<string>, filter: string = ''): void {
+  if (filter === 'tree:0') return;
+  const skipBlobs = filter === 'blob:none';
   const stack = [treeOid];
   while (stack.length) {
     const oid = stack.pop() as string;
     if (out.has(oid)) continue;
     const obj = getObj(repo, oid);
     if (!obj) continue;
+    if (skipBlobs && obj.type === 'blob') continue;
     out.add(oid);
-    if (obj.type === 'tree') for (const e of parseTree(obj.data)) stack.push(e.oid);
+    if (obj.type === 'tree') {
+      for (const e of parseTree(obj.data)) {
+        if (skipBlobs && e.mode !== '40000') continue;
+        stack.push(e.oid);
+      }
+    }
   }
 }
 function selectFetch(repo: Repo, args: FetchArgs): { objects: PackEntry[]; shallow: string[]; unshallow: string[] } {
+  const filter = args.filter;
   const roots: string[] = [];
+  const rootSet = new Set<string>();
   const direct = new Set<string>();
   for (const w of args.wants) {
     const obj = getObj(repo, w);
     if (!obj) continue;
-    if (obj.type === 'commit') roots.push(w);
-    else if (obj.type === 'tag') { direct.add(w); roots.push(peelToCommit(repo, w)); }
-    else direct.add(w);
+    if (obj.type === 'commit') {
+      if (!rootSet.has(w)) { rootSet.add(w); roots.push(w); }
+    } else if (obj.type === 'tag') {
+      direct.add(w);
+      const target = peelToCommit(repo, w);
+      if (!rootSet.has(target)) { rootSet.add(target); roots.push(target); }
+    } else {
+      direct.add(w);
+    }
   }
   let D: Set<string>;
   if (args.depth === null) {
     D = commitClosure(repo, roots);
+  } else if (args.depth === 1) {
+    // Fast path for shallow depth=1: D is just the root commits, O(|wants|).
+    D = new Set<string>();
+    for (const r of roots) {
+      const obj = getObj(repo, r);
+      if (obj && obj.type === 'commit') D.add(r);
+    }
   } else {
     D = new Set<string>();
     let frontier = [...roots];
@@ -1078,84 +1280,120 @@ function selectFetch(repo: Repo, args: FetchArgs): { objects: PackEntry[]; shall
   // Object set to send: depth-limited fetches take only D's own commits and
   // their trees/blobs — never ancestors. Full fetches take the whole closure.
   const wantSet = new Set<string>();
-  if (args.depth === null) {
+  if (args.depth === null && filter === '') {
     for (const o of fullClosure(repo, [...D, ...direct])) wantSet.add(o);
   } else {
     for (const c of D) {
       wantSet.add(c);
-      treeClosure(repo, commitTreeOid(repo, c), wantSet);
+      if (filter !== 'tree:0') treeClosure(repo, commitTreeOid(repo, c), wantSet, filter);
     }
     for (const oid of direct) {
-      wantSet.add(oid);
       const obj = getObj(repo, oid);
-      if (obj?.type === 'tag') {
+      if (!obj) continue;
+      if (filter === 'blob:none' && obj.type === 'blob') continue;
+      if (filter === 'tree:0' && (obj.type === 'blob' || obj.type === 'tree')) continue;
+      wantSet.add(oid);
+      if (obj.type === 'tag') {
         const target = parseTag(obj.data).object;
-        if (getObj(repo, target)?.type === 'commit') { wantSet.add(target); treeClosure(repo, commitTreeOid(repo, target), wantSet); }
-        else if (getObj(repo, target)?.type === 'tree') treeClosure(repo, target, wantSet);
+        const tobj = getObj(repo, target);
+        if (tobj?.type === 'commit') {
+          wantSet.add(target);
+          if (filter !== 'tree:0') treeClosure(repo, commitTreeOid(repo, target), wantSet, filter);
+        } else if (tobj?.type === 'tree' && filter !== 'tree:0') {
+          treeClosure(repo, target, wantSet, filter);
+        }
       }
     }
   }
-  const haveClosure = closureWithShallow(repo, args.haves, new Set(args.shallow));
-  const haveSet = new Set(args.haves);
-  const send = [...wantSet].filter((o) => !haveClosure.has(o)).sort();
-  const objects: PackEntry[] = send.map((oid) => {
+  const haveClosure = args.haves.length > 0 ? closureWithShallow(repo, args.haves, new Set(args.shallow)) : null;
+  const haveSet = args.haves.length > 0 ? new Set(args.haves) : null;
+  const send = (haveClosure ? [...wantSet].filter((o) => !haveClosure.has(o)) : [...wantSet]).sort();
+  const objects: PackEntry[] = new Array(send.length);
+  for (let i = 0; i < send.length; i++) {
+    const oid = send[i];
     const o = getObj(repo, oid) as GitObj;
-    return { oid, type: o.type, data: o.data };
-  });
+    objects[i] = { oid, type: o.type, data: o.data, obj: o };
+  }
   const shallow: string[] = [];
   const unshallow: string[] = [];
+  const clientShallowSet = args.shallow.length > 0 ? new Set(args.shallow) : null;
   for (const c of D) {
     const parents = commitParents(repo, c);
     if (parents.length === 0) continue;
-    if (args.shallow.includes(c) && parents.every((p) => D.has(p))) { unshallow.push(c); continue; }
-    if (parents.some((p) => !D.has(p) && !haveSet.has(p))) shallow.push(c);
+    if (clientShallowSet !== null && clientShallowSet.has(c) && parents.every((p) => D.has(p))) { unshallow.push(c); continue; }
+    if (parents.some((p) => !D.has(p) && (haveSet === null || !haveSet.has(p)))) shallow.push(c);
   }
+  if (shallow.length > 1) shallow.sort();
+  if (unshallow.length > 1) unshallow.sort();
   return { objects, shallow, unshallow };
 }
-function sidebandPack(pack: Buffer): Buffer {
-  const out: Buffer[] = [];
-  for (let off = 0; off < pack.length; off += 65515) {
-    const chunk = pack.subarray(off, Math.min(off + 65515, pack.length));
-    out.push(pktLine(Buffer.concat([Buffer.from([1]), chunk])));
+
+const HEX_CHARS = Buffer.from('0123456789abcdef', 'ascii');
+const EMPTY_SIDEBAND_PKT = Buffer.from('0005\x01', 'latin1');
+// Frame raw pack/status bytes onto side-band channel 1 in a single allocation.
+// side-band-64k: max pkt-line = 65520 bytes (4 length + 1 channel + 65515 payload).
+// side-band: max pkt-line = 1000 bytes (4 length + 1 channel + 995 payload).
+function sidebandPack(pack: Buffer, maxChunk: number = 65515): Buffer {
+  if (pack.length === 0) return EMPTY_SIDEBAND_PKT;
+  const numChunks = Math.ceil(pack.length / maxChunk);
+  const out = Buffer.allocUnsafe(pack.length + numChunks * 5);
+  let src = 0;
+  let dst = 0;
+  while (src < pack.length) {
+    const end = src + maxChunk < pack.length ? src + maxChunk : pack.length;
+    const chunkLen = end - src;
+    const pktLen = chunkLen + 5;
+    out[dst] = HEX_CHARS[(pktLen >> 12) & 0xf];
+    out[dst + 1] = HEX_CHARS[(pktLen >> 8) & 0xf];
+    out[dst + 2] = HEX_CHARS[(pktLen >> 4) & 0xf];
+    out[dst + 3] = HEX_CHARS[pktLen & 0xf];
+    out[dst + 4] = 1;
+    pack.copy(out, dst + 5, src, end);
+    dst += pktLen;
+    src = end;
   }
-  if (pack.length === 0) out.push(pktLine(Buffer.from([1])));
-  return Buffer.concat(out);
+  return out;
 }
-function v2FetchResponse(repo: Repo, args: FetchArgs): Buffer {
-  const key = `v2|${fetchCacheKey(repo, args)}`;
-  const hit = fetchCache.get(key);
-  if (hit) return hit;
-  const sel = selectFetch(repo, args);
-  const parts: Buffer[] = [];
-  parts.push(pktLine('acknowledgments\n'));
-  // An ACK can only name a have the client sent; with no haves the whole
-  // 200-commit closure walk below is pure waste (the clone workload's case).
-  let ack: string | undefined;
-  if (args.haves.length > 0) {
-    const wantClosure = commitClosure(repo, args.wants.filter((w) => {
-      const o = getObj(repo, w);
-      return !!o && o.type === 'commit';
-    }));
-    ack = args.haves.find((h) => wantClosure.has(h));
-  }
-  if (ack) { parts.push(pktLine(`ACK ${ack}\n`)); parts.push(pktLine('ready\n')); }
-  else parts.push(pktLine('NAK\n'));
-  parts.push(FLUSH);
-  if (sel.shallow.length > 0 || sel.unshallow.length > 0) {
-    parts.push(pktLine('shallow-info\n'));
-    for (const s of sel.shallow) parts.push(pktLine(`shallow ${s}\n`));
-    for (const s of sel.unshallow) parts.push(pktLine(`unshallow ${s}\n`));
+function v2FetchResponse(repo: Repo, args: FetchArgs): Buffer | Promise<Buffer> {
+  const key = fetchCacheKey('v2', repo, args);
+  return getOrBuildUploadPack(key, canCacheFetch(repo, args), () => {
+    const sel = selectFetch(repo, args);
+    const parts: Buffer[] = [];
+    parts.push(pktLine('acknowledgments\n'));
+    // An ACK can only name a have the client sent; with no haves the whole
+    // 200-commit closure walk below is pure waste (the clone workload's case).
+    let ack: string | undefined;
+    if (args.haves.length > 0) {
+      const wantClosure = commitClosure(repo, args.wants.filter((w) => {
+        const o = getObj(repo, w);
+        return !!o && o.type === 'commit';
+      }));
+      const sortedHaves = [...args.haves].sort();
+      ack = sortedHaves.find((h) => wantClosure.has(h));
+    }
+    if (ack) { parts.push(pktLine(`ACK ${ack}\n`)); parts.push(pktLine('ready\n')); }
+    else parts.push(pktLine('NAK\n'));
     parts.push(FLUSH);
-  }
-  parts.push(pktLine('packfile\n'));
-  parts.push(sidebandPack(writePack(sel.objects)));
-  parts.push(FLUSH);
-  return cachePut(fetchCache, key, Buffer.concat(parts));
+    if (sel.shallow.length > 0 || sel.unshallow.length > 0) {
+      parts.push(pktLine('shallow-info\n'));
+      for (const s of sel.shallow) parts.push(pktLine(`shallow ${s}\n`));
+      for (const s of sel.unshallow) parts.push(pktLine(`unshallow ${s}\n`));
+      parts.push(FLUSH);
+    }
+    parts.push(pktLine('packfile\n'));
+    parts.push(sidebandPack(writePack(sel.objects), 65515));
+    parts.push(FLUSH);
+    return Buffer.concat(parts);
+  });
 }
-function v0FetchResponse(repo: Repo, body: Buffer): Buffer {
+function v0FetchResponse(repo: Repo, body: Buffer): Buffer | Promise<Buffer> {
   const packets = parsePktLines(body);
-  const args: FetchArgs = { wants: [], haves: [], shallow: [], depth: null, deepenSince: null, deepenNot: [] };
+  const args: FetchArgs = {
+    wants: [], haves: [], shallow: [], depth: null, deepenSince: null, deepenNot: [],
+    filter: '', capsMask: 0,
+  };
   let section = 0;
+  let sawAnyCaps = false;
   for (const p of packets) {
     if (p.kind === 'flush') { section++; continue; }
     if (p.kind !== 'data') continue;
@@ -1163,34 +1401,67 @@ function v0FetchResponse(repo: Repo, body: Buffer): Buffer {
     const nul = line.indexOf('\0');
     if (nul >= 0) line = line.slice(0, nul);
     if (section === 0) {
-      if (line.startsWith('want ')) args.wants.push(line.slice(5));
-      else if (line.startsWith('shallow ')) args.shallow.push(line.slice(8));
+      if (line.startsWith('want ')) {
+        const rest = line.slice(5);
+        const sp = rest.indexOf(' ');
+        if (sp < 0) {
+          args.wants.push(rest);
+        } else {
+          args.wants.push(rest.slice(0, sp));
+          sawAnyCaps = true;
+          const capTokens = rest.slice(sp + 1).split(' ');
+          for (const cap of capTokens) {
+            if (cap === 'side-band-64k') args.capsMask |= CAP_SIDE_BAND_64K;
+            else if (cap === 'side-band') args.capsMask |= CAP_SIDE_BAND;
+            else if (cap === 'no-progress') args.capsMask |= CAP_NO_PROGRESS;
+            else if (cap === 'ofs-delta') args.capsMask |= CAP_OFS_DELTA;
+            else if (cap === 'include-tag') args.capsMask |= CAP_INCLUDE_TAG;
+            else if (cap === 'multi_ack') args.capsMask |= CAP_MULTI_ACK;
+            else if (cap === 'multi_ack_detailed') args.capsMask |= CAP_MULTI_ACK_DETAILED;
+            else if (cap === 'no-done') args.capsMask |= CAP_NO_DONE;
+            else if (cap === 'thin-pack') args.capsMask |= CAP_THIN_PACK;
+          }
+        }
+      } else if (line.startsWith('shallow ')) args.shallow.push(line.slice(8));
       else if (line.startsWith('deepen ')) args.depth = parseInt(line.slice(7), 10);
       else if (line.startsWith('deepen-since ')) args.deepenSince = parseInt(line.slice(13), 10);
       else if (line.startsWith('deepen-not ')) args.deepenNot.push(line.slice(11));
+      else if (line.startsWith('filter ')) args.filter = line.slice(7);
     } else if (line.startsWith('have ')) args.haves.push(line.slice(5));
+    else if (line === 'done') args.capsMask |= CAP_DONE;
   }
-  const key = `v0|${fetchCacheKey(repo, args)}`;
-  const hit = fetchCache.get(key);
-  if (hit) return hit;
-  const sel = selectFetch(repo, args);
-  const parts: Buffer[] = [];
-  // See v2FetchResponse: no haves means no ACK is possible; skip the closure.
-  let ack: string | undefined;
-  if (args.haves.length > 0) {
-    const wantClosure = commitClosure(repo, args.wants.filter((w) => {
-      const o = getObj(repo, w);
-      return !!o && o.type === 'commit';
-    }));
-    ack = args.haves.find((h) => wantClosure.has(h));
-  }
-  if (ack) parts.push(pktLine(`ACK ${ack}\n`));
-  else parts.push(pktLine('NAK\n'));
-  for (const s of sel.shallow) parts.push(pktLine(`shallow ${s}\n`));
-  for (const s of sel.unshallow) parts.push(pktLine(`unshallow ${s}\n`));
-  parts.push(sidebandPack(writePack(sel.objects)));
-  parts.push(FLUSH);
-  return cachePut(fetchCache, key, Buffer.concat(parts));
+  // Preserve v9 default side-band-64k when client omits capability tokens.
+  if (!sawAnyCaps) args.capsMask |= CAP_SIDE_BAND_64K;
+  const key = fetchCacheKey('v0', repo, args);
+  return getOrBuildUploadPack(key, canCacheFetch(repo, args), () => {
+    const sel = selectFetch(repo, args);
+    const parts: Buffer[] = [];
+    // See v2FetchResponse: no haves means no ACK is possible; skip the closure.
+    let ack: string | undefined;
+    if (args.haves.length > 0) {
+      const wantClosure = commitClosure(repo, args.wants.filter((w) => {
+        const o = getObj(repo, w);
+        return !!o && o.type === 'commit';
+      }));
+      const sortedHaves = [...args.haves].sort();
+      ack = sortedHaves.find((h) => wantClosure.has(h));
+    }
+    if (ack) parts.push(pktLine(`ACK ${ack}\n`));
+    else parts.push(pktLine('NAK\n'));
+    for (const s of sel.shallow) parts.push(pktLine(`shallow ${s}\n`));
+    for (const s of sel.unshallow) parts.push(pktLine(`unshallow ${s}\n`));
+    const pack = writePack(sel.objects);
+    if (args.capsMask & CAP_SIDE_BAND_64K) {
+      parts.push(sidebandPack(pack, 65515));
+      parts.push(FLUSH);
+    } else if (args.capsMask & CAP_SIDE_BAND) {
+      parts.push(sidebandPack(pack, 995));
+      parts.push(FLUSH);
+    } else {
+      parts.push(pack);
+    }
+    return Buffer.concat(parts);
+  });
 }
 
 interface PushCmd { oldOid: string; newOid: string; ref: string; }
@@ -1222,7 +1493,7 @@ async function receivePackResponse(repo: Repo, body: Buffer): Promise<Buffer> {
     try {
       const entries = await readPack(rawPack);
       for (const e of entries) {
-        if (!repo.objects.has(e.oid)) repo.objects.set(e.oid, { type: e.type, data: e.data });
+        if (!repo.objects.has(e.oid)) repo.objects.set(e.oid, { type: e.type, data: e.data, packedEntry: e.packedEntry ?? null });
       }
     } catch (err) {
       unpackError = err instanceof Error ? err.message : 'unpack failed';
@@ -1252,13 +1523,7 @@ async function receivePackResponse(repo: Repo, body: Buffer): Promise<Buffer> {
     }
   }
   const inner = pktLines([...lines, 'flush']);
-  const out: Buffer[] = [];
-  for (let off = 0; off < inner.length; off += 65515) {
-    const chunk = inner.subarray(off, Math.min(off + 65515, inner.length));
-    out.push(pktLine(Buffer.concat([Buffer.from([1]), chunk])));
-  }
-  out.push(FLUSH);
-  return Buffer.concat(out);
+  return Buffer.concat([sidebandPack(inner, 65515), FLUSH]);
 }
 
 async function handleGit(req: IncomingMessage, res: ServerResponse, path: string): Promise<boolean> {
@@ -1305,11 +1570,13 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
       return true;
     }
     if (v2 && command === 'fetch') {
-      sendRaw(res, 200, v2FetchResponse(repo, parseFetchArgs(packets)), 'application/x-git-upload-pack-result');
+      const resp = v2FetchResponse(repo, parseFetchArgs(packets));
+      sendRaw(res, 200, Buffer.isBuffer(resp) ? resp : await resp, 'application/x-git-upload-pack-result');
       return true;
     }
     if (!v2) {
-      sendRaw(res, 200, v0FetchResponse(repo, body), 'application/x-git-upload-pack-result');
+      const resp = v0FetchResponse(repo, body);
+      sendRaw(res, 200, Buffer.isBuffer(resp) ? resp : await resp, 'application/x-git-upload-pack-result');
       return true;
     }
     sendJson(res, 400, { message: 'unknown command' });
