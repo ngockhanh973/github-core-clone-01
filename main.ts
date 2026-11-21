@@ -373,46 +373,42 @@ function inflateEntryStream(buf: Buffer, off: number, size: number): Promise<{ d
 const DELTA_BASE_LRU_MAX_BYTES = 32 * 1024 * 1024;
 const DELTA_BASE_MAX_ITEM_BYTES = 1024 * 1024;
 class DeltaBaseByteLru {
+  // Map insertion order is LRU order; entry.data.length tracks byte usage directly.
   private byOffset = new Map<number, PackEntry>();
-  private byOid = new Map<string, PackEntry>();
-  private lruOffsets = new Map<number, number>(); // offset -> byteLen (insertion order = LRU)
+  private byOid: Map<string, PackEntry> | null;
   private totalBytes = 0;
 
+  constructor(trackByOid: boolean) {
+    this.byOid = trackByOid ? new Map<string, PackEntry>() : null;
+  }
   getByOffset(offset: number): PackEntry | undefined {
     const entry = this.byOffset.get(offset);
     if (entry === undefined) return undefined;
-    const sz = this.lruOffsets.get(offset);
-    if (sz !== undefined) {
-      this.lruOffsets.delete(offset);
-      this.lruOffsets.set(offset, sz);
-    }
+    this.byOffset.delete(offset);
+    this.byOffset.set(offset, entry);
     return entry;
   }
   getByOid(oid: string): PackEntry | undefined {
-    return this.byOid.get(oid);
+    return this.byOid !== null ? this.byOid.get(oid) : undefined;
   }
   put(offset: number, entry: PackEntry): void {
     const sz = entry.data.length;
     if (sz > DELTA_BASE_MAX_ITEM_BYTES) return;
-    if (this.lruOffsets.has(offset)) return;
-    while (this.totalBytes + sz > DELTA_BASE_LRU_MAX_BYTES && this.lruOffsets.size > 0) {
-      const oldestOff = this.lruOffsets.keys().next().value as number;
-      const oldestSz = this.lruOffsets.get(oldestOff) as number;
-      this.lruOffsets.delete(oldestOff);
-      this.totalBytes -= oldestSz;
-      const evicted = this.byOffset.get(oldestOff);
+    if (this.byOffset.has(offset)) return;
+    while (this.totalBytes + sz > DELTA_BASE_LRU_MAX_BYTES && this.byOffset.size > 0) {
+      const oldestOff = this.byOffset.keys().next().value as number;
+      const evicted = this.byOffset.get(oldestOff) as PackEntry;
       this.byOffset.delete(oldestOff);
-      if (evicted !== undefined) this.byOid.delete(evicted.oid);
+      this.totalBytes -= evicted.data.length;
+      if (this.byOid !== null) this.byOid.delete(evicted.oid);
     }
-    this.lruOffsets.set(offset, sz);
     this.totalBytes += sz;
     this.byOffset.set(offset, entry);
-    this.byOid.set(entry.oid, entry);
+    if (this.byOid !== null) this.byOid.set(entry.oid, entry);
   }
   clear(): void {
     this.byOffset.clear();
-    this.byOid.clear();
-    this.lruOffsets.clear();
+    if (this.byOid !== null) this.byOid.clear();
     this.totalBytes = 0;
   }
 }
@@ -431,17 +427,35 @@ const PACK_TYPE_MAP: Record<number, ObjType | null> = { 1: 'commit', 2: 'tree', 
 
 function resolvePackRaws(
   raws: RawPackItem[],
-  rawByOffset: Map<number, RawPackItem>,
+  hasOfsDelta: boolean,
+  hasRefDelta: boolean,
   existingObjects?: Map<string, GitObj>,
 ): PackEntry[] {
-  const baseCache = new DeltaBaseByteLru();
+  const n = raws.length;
+  const out: PackEntry[] = new Array(n);
+  // Zero-delta fast path: skip all delta maps/LRU/sets.
+  if (!hasOfsDelta && !hasRefDelta) {
+    for (let i = 0; i < n; i++) {
+      const r = raws[i];
+      const t = r.type as ObjType;
+      out[i] = { oid: hashObject(t, r.data), type: t, data: r.data, packedEntry: r.packedEntry };
+    }
+    return out;
+  }
+
+  let rawByOffset: Map<number, RawPackItem> | null = null;
+  if (hasOfsDelta) {
+    rawByOffset = new Map<number, RawPackItem>();
+    for (let i = 0; i < n; i++) rawByOffset.set(raws[i].offset, raws[i]);
+  }
+  const baseCache = new DeltaBaseByteLru(hasRefDelta);
   let rawByOid: Map<string, RawPackItem> | null = null;
   const seen = new Set<number>();
 
   const ensureRawByOid = (): Map<string, RawPackItem> => {
     if (rawByOid !== null) return rawByOid;
     rawByOid = new Map<string, RawPackItem>();
-    for (let i = 0; i < raws.length; i++) {
+    for (let i = 0; i < n; i++) {
       const r = raws[i];
       if (r.type !== null) {
         const oid = hashObject(r.type, r.data);
@@ -463,7 +477,7 @@ function resolvePackRaws(
       } else if (raw.baseOffset !== null) {
         let base = baseCache.getByOffset(raw.baseOffset);
         if (base === undefined) {
-          const baseRaw = rawByOffset.get(raw.baseOffset);
+          const baseRaw = rawByOffset!.get(raw.baseOffset);
           if (!baseRaw) throw new Error('ofs-delta base missing');
           base = resolve(baseRaw);
         }
@@ -500,10 +514,8 @@ function resolvePackRaws(
     return entry;
   };
 
-  const out: PackEntry[] = new Array(raws.length);
-  for (let i = 0; i < raws.length; i++) {
+  for (let i = 0; i < n; i++) {
     const raw = raws[i];
-    // Fast path for non-delta objects: no recursion or seen-set manipulation needed.
     if (raw.type !== null) {
       let entry = baseCache.getByOffset(raw.offset);
       if (entry === undefined) {
@@ -529,11 +541,12 @@ function readPack(buf: Buffer, existingObjects?: Map<string, GitObj>): PackEntry
   const expect = sha1(buf.subarray(0, trailerStart));
   if (buf.subarray(trailerStart).toString('hex') !== expect) throw new Error('pack checksum mismatch');
 
-  const raws: RawPackItem[] = [];
-  const rawByOffset = new Map<number, RawPackItem>();
+  const raws: RawPackItem[] = new Array(count);
+  let hasOfsDelta = false;
+  let hasRefDelta = false;
   let off = 12;
 
-  const parseEntryHeader = (): { start: number; typeCode: number; size: number; baseOffset: number | null; baseOid: string | null } => {
+  for (let i = 0; i < count; i++) {
     const start = off;
     if (off >= trailerStart) throw new Error('pack truncated');
     let b = buf[off++];
@@ -549,6 +562,7 @@ function readPack(buf: Buffer, existingObjects?: Map<string, GitObj>): PackEntry
     let baseOffset: number | null = null;
     let baseOid: string | null = null;
     if (typeCode === 6) {
+      hasOfsDelta = true;
       if (off >= trailerStart) throw new Error('ofs-delta truncated');
       let bb = buf[off++];
       let base = bb & 0x7f;
@@ -558,53 +572,77 @@ function readPack(buf: Buffer, existingObjects?: Map<string, GitObj>): PackEntry
       }
       baseOffset = start - base;
     } else if (typeCode === 7) {
+      hasRefDelta = true;
       if (off + 20 > trailerStart) throw new Error('ref-delta truncated');
       baseOid = buf.subarray(off, off + 20).toString('hex');
       off += 20;
     }
-    return { start, typeCode, size, baseOffset, baseOid };
-  };
-
-  for (let i = 0; i < count; i++) {
-    const hdr = parseEntryHeader();
     try {
-      const { data, consumed } = inflateEntrySync(buf, off, hdr.size);
+      const { data, consumed } = inflateEntrySync(buf, off, size);
       off += consumed;
-      const objType = PACK_TYPE_MAP[hdr.typeCode] ?? null;
-      const packedEntry = objType !== null ? Buffer.from(buf.subarray(hdr.start, off)) : null;
-      const item: RawPackItem = {
-        offset: hdr.start, typeCode: hdr.typeCode, type: objType, data,
-        baseOffset: hdr.baseOffset, baseOid: hdr.baseOid, packedEntry,
-      };
-      raws.push(item);
-      rawByOffset.set(hdr.start, item);
+      const objType = PACK_TYPE_MAP[typeCode] ?? null;
+      const packedEntry = objType !== null ? Buffer.from(buf.subarray(start, off)) : null;
+      raws[i] = { offset: start, typeCode, type: objType, data, baseOffset, baseOid, packedEntry };
     } catch {
       // Async streaming fallback from entry `i` onward (only for >= 2 MiB or edge streams).
       return (async () => {
-        let curHdr = hdr;
+        let curStart = start;
+        let curTypeCode = typeCode;
+        let curSize = size;
+        let curBaseOffset = baseOffset;
+        let curBaseOid = baseOid;
         for (let j = i; j < count; j++) {
-          if (j > i) curHdr = parseEntryHeader();
+          if (j > i) {
+            curStart = off;
+            if (off >= trailerStart) throw new Error('pack truncated');
+            let b2 = buf[off++];
+            curTypeCode = (b2 >> 4) & 7;
+            curSize = b2 & 0x0f;
+            let sh = 4;
+            while (b2 & 0x80) {
+              if (off >= trailerStart) throw new Error('pack truncated');
+              b2 = buf[off++];
+              curSize |= (b2 & 0x7f) << sh;
+              sh += 7;
+            }
+            curBaseOffset = null;
+            curBaseOid = null;
+            if (curTypeCode === 6) {
+              hasOfsDelta = true;
+              if (off >= trailerStart) throw new Error('ofs-delta truncated');
+              let bb2 = buf[off++];
+              let bs2 = bb2 & 0x7f;
+              while (bb2 & 0x80) {
+                bb2 = buf[off++];
+                bs2 = ((bs2 + 1) << 7) | (bb2 & 0x7f);
+              }
+              curBaseOffset = curStart - bs2;
+            } else if (curTypeCode === 7) {
+              hasRefDelta = true;
+              if (off + 20 > trailerStart) throw new Error('ref-delta truncated');
+              curBaseOid = buf.subarray(off, off + 20).toString('hex');
+              off += 20;
+            }
+          }
           let res: { data: Buffer; consumed: number };
           try {
-            res = inflateEntrySync(buf, off, curHdr.size);
+            res = inflateEntrySync(buf, off, curSize);
           } catch {
-            res = await inflateEntryStream(buf, off, curHdr.size);
+            res = await inflateEntryStream(buf, off, curSize);
           }
           off += res.consumed;
-          const objType = PACK_TYPE_MAP[curHdr.typeCode] ?? null;
-          const packedEntry = objType !== null ? Buffer.from(buf.subarray(curHdr.start, off)) : null;
-          const item: RawPackItem = {
-            offset: curHdr.start, typeCode: curHdr.typeCode, type: objType, data: res.data,
-            baseOffset: curHdr.baseOffset, baseOid: curHdr.baseOid, packedEntry,
+          const objType = PACK_TYPE_MAP[curTypeCode] ?? null;
+          const packedEntry = objType !== null ? Buffer.from(buf.subarray(curStart, off)) : null;
+          raws[j] = {
+            offset: curStart, typeCode: curTypeCode, type: objType, data: res.data,
+            baseOffset: curBaseOffset, baseOid: curBaseOid, packedEntry,
           };
-          raws.push(item);
-          rawByOffset.set(curHdr.start, item);
         }
-        return resolvePackRaws(raws, rawByOffset, existingObjects);
+        return resolvePackRaws(raws, hasOfsDelta, hasRefDelta, existingObjects);
       })();
     }
   }
-  return resolvePackRaws(raws, rawByOffset, existingObjects);
+  return resolvePackRaws(raws, hasOfsDelta, hasRefDelta, existingObjects);
 }
 
 function writePack(entries: PackEntry[]): Buffer {
